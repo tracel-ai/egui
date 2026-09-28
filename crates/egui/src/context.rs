@@ -4434,15 +4434,21 @@ mod test {
         ctx.request_repaint_after(Duration::from_secs(1));
         ctx.request_repaint_after(Duration::from_secs(2));
 
+        // On 0.36.2 egui subtracts one predicted frame from each delay, so
+        // compare the requests with each other rather than with 1 s and 2 s.
+        let callback = callback_delays.lock().clone();
+        let observer = observer_delays.lock().clone();
         assert_eq!(
-            *callback_delays.lock(),
-            [Duration::from_secs(1)],
+            callback.len(),
+            1,
             "The callback is only called when the repaint comes sooner"
         );
+        assert_eq!(observer.len(), 2, "The observer sees every request");
+        assert_eq!(observer[0], callback[0], "Both see the first request alike");
         assert_eq!(
-            *observer_delays.lock(),
-            [Duration::from_secs(1), Duration::from_secs(2)],
-            "The observer sees every request"
+            observer[1] - observer[0],
+            Duration::from_secs(1),
+            "The observer sees the later request"
         );
     }
 

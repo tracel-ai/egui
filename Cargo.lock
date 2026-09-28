@@ -1323,6 +1323,7 @@ dependencies = [
  "egui",
  "epaint",
  "log",
+ "pollster 0.4.0",
  "profiling",
  "thiserror 2.0.18",
  "type-map",

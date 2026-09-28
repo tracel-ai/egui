@@ -1516,7 +1516,7 @@ fn order_map_total_ordering() {
 #[test]
 fn set_state_makes_layer_hit_testable() {
     let ctx = crate::Context::default();
-    let layer_id = LayerId::new(Order::Foreground, Id::unique("layer"));
+    let layer_id = LayerId::new(Order::Foreground, Id::new("layer"));
     let rect = Rect::from_min_size(crate::pos2(10.0, 20.0), vec2(100.0, 50.0));
     let outside = crate::pos2(200.0, 200.0);
 
