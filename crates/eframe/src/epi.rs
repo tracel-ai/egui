@@ -277,6 +277,11 @@ pub trait App {
     ///
     /// This function does not return a value. Any changes to the input should be made directly to `_raw_input`.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
+
+    /// Called for each native pinch before its phase is discarded by egui-winit.
+    /// The same delta is subsequently delivered through `egui::Event::Zoom`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn on_native_pinch(&mut self, _delta: f64, _phase: egui::TouchPhase) {}
 }
 
 /// Options controlling the behavior of a native window.
@@ -374,6 +379,36 @@ pub struct NativeOptions {
     #[cfg(feature = "wgpu_no_default_features")]
     pub wgpu_options: egui_wgpu::WgpuConfiguration,
 
+    /// Optional GPU paint cadence for retained native WGPU frames.
+    ///
+    /// The callback is queried after a normal egui frame and after each retained
+    /// paint-only tick. It receives the current monitor refresh rate in
+    /// millihertz when available, whether the completed frame was paint-only,
+    /// and the frame's start instant for deadline and overload calculations.
+    /// When it returns a duration, subsequent animation ticks replay the last
+    /// paint jobs without rerunning the application's UI or uploading unchanged
+    /// meshes. Any input, external repaint, resize, or viewport change resumes
+    /// a full pass. Both the WGPU and glow renderers (ueye patch) support it.
+    pub retained_repaint_after: Option<
+        fn(&egui::Context, Option<u32>, bool, std::time::Instant) -> Option<core::time::Duration>,
+    >,
+
+    /// Ueye patch: whether a pointer move needs a UI pass (DESIGN.md 9.4).
+    /// It receives the pointer position in points, or `None` when the pointer
+    /// left the window. A move it rejects is still given to egui, which sees
+    /// it on the next pass, but it neither runs a pass nor requests a redraw.
+    /// Only the root viewport is filtered; `None` runs a pass for every move.
+    pub pointer_move_needs_ui_pass: Option<fn(&egui::Context, Option<egui::Pos2>) -> bool>,
+
+    /// Ueye patch (DESIGN.md 9.8): a pass that had input settles in that pass.
+    /// egui asks for an immediate repaint after any input, and each such
+    /// request costs two more passes; with this set, the next pass comes
+    /// from what the app asked for while the pass ran, and egui's follow-up
+    /// is kept only while scrolling, touching, dragging or hovering files.
+    /// A root pass wakes the event loop once, after it ends; requests from
+    /// other threads, and between passes, still wake it right away.
+    pub one_pass_per_input: bool,
+
     /// Controls whether or not the native window position and size will be
     /// persisted (only if the "persistence" feature is enabled).
     pub persist_window: bool,
@@ -460,6 +495,12 @@ impl Default for NativeOptions {
             wgpu_options: egui_wgpu::WgpuConfiguration::default()
                 .with_surface_config(egui_wgpu::SurfaceConfig::LOW_LATENCY),
 
+            retained_repaint_after: None,
+
+            pointer_move_needs_ui_pass: None,
+
+            one_pass_per_input: false,
+
             persist_window: true,
 
             persistence_path: None,
@@ -527,6 +568,19 @@ pub struct WebOptions {
     /// Maximum rate at which to repaint. This can be used to artificially reduce the repaint rate below
     /// vsync in order to save resources.
     pub max_fps: Option<u32>,
+
+    /// Ueye patch: the cadence of retained paint-only frames, as
+    /// [`NativeOptions::retained_repaint_after`]. When it returns a duration,
+    /// the runner replays the last paint jobs at that interval without
+    /// running the app, and it only requests animation frames while a UI
+    /// pass or a paint-only frame is due.
+    pub retained_repaint_after: Option<
+        fn(&egui::Context, Option<u32>, bool, web_time::Instant) -> Option<core::time::Duration>,
+    >,
+
+    /// Ueye patch: whether a pointer move needs a UI pass, as
+    /// [`NativeOptions::pointer_move_needs_ui_pass`].
+    pub pointer_move_needs_ui_pass: Option<fn(&egui::Context, Option<egui::Pos2>) -> bool>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -553,6 +607,10 @@ impl Default for WebOptions {
             should_prevent_default: Box::new(|_| true),
 
             max_fps: None,
+
+            retained_repaint_after: None,
+
+            pointer_move_needs_ui_pass: None,
         }
     }
 }

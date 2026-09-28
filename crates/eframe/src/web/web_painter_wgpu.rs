@@ -167,6 +167,60 @@ impl WebPainter for WebPainterWgpu {
         textures_delta: &mut egui::TexturesDelta,
         capture_data: Vec<UserData>,
     ) -> Result<(), JsValue> {
+        self.paint_impl(
+            clear_color,
+            clipped_primitives,
+            pixels_per_point,
+            textures_delta,
+            capture_data,
+            false,
+        )
+    }
+
+    fn paint_retained(
+        &mut self,
+        clear_color: [f32; 4],
+        clipped_primitives: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+    ) -> Result<(), JsValue> {
+        self.paint_impl(
+            clear_color,
+            clipped_primitives,
+            pixels_per_point,
+            &mut egui::TexturesDelta::default(),
+            Vec::new(),
+            true,
+        )
+    }
+
+    fn handle_screenshots(&mut self, events: &mut Vec<Event>) {
+        for (viewport_id, user_data, screenshot) in self.capture_rx.try_iter() {
+            let screenshot = Arc::new(screenshot);
+            for data in user_data {
+                events.push(Event::Screenshot {
+                    viewport_id,
+                    user_data: data,
+                    image: Arc::clone(&screenshot),
+                });
+            }
+        }
+    }
+
+    fn destroy(&mut self) {
+        self.render_state = None;
+    }
+}
+
+impl WebPainterWgpu {
+    fn paint_impl(
+        &mut self,
+        clear_color: [f32; 4],
+        clipped_primitives: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+        textures_delta: &mut egui::TexturesDelta,
+        capture_data: Vec<UserData>,
+        retained: bool,
+    ) -> Result<(), JsValue> {
         let capture = !capture_data.is_empty();
 
         let size_in_pixels = [self.canvas.width(), self.canvas.height()];
@@ -222,13 +276,25 @@ impl WebPainter for WebPainterWgpu {
                 }
             }
 
-            renderer.update_buffers(
-                &render_state.device,
-                &render_state.queue,
-                &mut encoder,
-                clipped_primitives,
-                &screen_descriptor,
-            )
+            // Ueye patch: a paint-only frame keeps the uploaded buffers and
+            // only prepares the callbacks again.
+            if retained {
+                renderer.update_callbacks_only(
+                    &render_state.device,
+                    &render_state.queue,
+                    &mut encoder,
+                    clipped_primitives,
+                    &screen_descriptor,
+                )
+            } else {
+                renderer.update_buffers(
+                    &render_state.device,
+                    &render_state.queue,
+                    &mut encoder,
+                    clipped_primitives,
+                    &screen_descriptor,
+                )
+            }
         };
 
         // Resize surface if needed
@@ -398,22 +464,5 @@ impl WebPainter for WebPainterWgpu {
         }
 
         Ok(())
-    }
-
-    fn handle_screenshots(&mut self, events: &mut Vec<Event>) {
-        for (viewport_id, user_data, screenshot) in self.capture_rx.try_iter() {
-            let screenshot = Arc::new(screenshot);
-            for data in user_data {
-                events.push(Event::Screenshot {
-                    viewport_id,
-                    user_data: data,
-                    image: Arc::clone(&screenshot),
-                });
-            }
-        }
-    }
-
-    fn destroy(&mut self) {
-        self.render_state = None;
     }
 }

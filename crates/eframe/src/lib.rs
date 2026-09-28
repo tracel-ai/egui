@@ -168,6 +168,10 @@ pub use epi::*;
 
 pub(crate) mod stopwatch;
 
+// Ueye patch: pointer filtering (DESIGN.md 9.4).
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub(crate) mod pointer_filter;
+
 // ----------------------------------------------------------------------------
 // When compiling for web
 

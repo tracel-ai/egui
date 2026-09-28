@@ -15,15 +15,18 @@ use web_sys::{Document, EventTarget, ShadowRoot};
 
 // ------------------------------------------------------------------------
 
-/// Calls `request_animation_frame` to schedule repaint.
+/// Paints if needed, then schedules the next frame.
 ///
-/// It will only paint if needed, but will always call `request_animation_frame` immediately.
+/// Ueye patch: an animation frame is only requested while a UI pass or a
+/// paint-only frame is due; a later one waits on a timer, and nothing is
+/// scheduled at rest (DESIGN.md 9.6).
 pub(crate) fn paint_and_schedule(runner_ref: &WebRunner) -> Result<(), JsValue> {
     // Only paint and schedule if there has been no panic
     if let Some(mut runner_lock) = runner_ref.try_lock() {
         paint_if_needed(&mut runner_lock);
+        let next = runner_lock.next_frame_time();
         drop(runner_lock);
-        runner_ref.request_animation_frame()?;
+        runner_ref.schedule_frame(next)?;
     }
     Ok(())
 }
@@ -54,6 +57,9 @@ fn paint_if_needed(runner: &mut AppRunner) {
 
             runner.report_frame_time(stopwatch.total_time_sec());
         }
+    } else if runner.paint_only_due() {
+        // Ueye patch: a paint-only frame replays the last paint jobs.
+        runner.paint_only();
     }
     runner.auto_save_if_needed();
 }
@@ -659,8 +665,15 @@ fn install_mousemove(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
             let egui_event = egui::Event::PointerMoved(pos);
             let should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
             let should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
+            // Ueye patch (DESIGN.md 9.4): a move the hit map filters runs no pass.
+            let filtered = runner.pointer_move_filtered(Some(pos));
+            if filtered {
+                crate::pointer_filter::drop_superseded_pointer_move(&mut runner.input.raw);
+            }
             runner.input.raw.events.push(egui_event);
-            runner.needs_repaint.repaint();
+            if !filtered {
+                runner.needs_repaint.repaint();
+            }
 
             // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
             if should_stop_propagation {
@@ -680,7 +693,10 @@ fn install_mouseleave(runner_ref: &WebRunner, target: &EventTarget) -> Result<()
         "mouseleave",
         |event: web_sys::MouseEvent, runner| {
             runner.input.raw.events.push(egui::Event::PointerGone);
-            runner.needs_repaint.repaint_asap();
+            // Ueye patch (DESIGN.md 9.4): leaving over nothing runs no pass.
+            if !runner.pointer_move_filtered(None) {
+                runner.needs_repaint.repaint_asap();
+            }
 
             // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
             if (runner.web_options.should_stop_propagation)(&egui::Event::PointerGone) {

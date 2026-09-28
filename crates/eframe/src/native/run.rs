@@ -7,7 +7,7 @@ use winit::{
     window::WindowId,
 };
 
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 
 use super::winit_integration::{UserEvent, WinitApp};
 use crate::{
@@ -25,6 +25,25 @@ use crate::{
 /// processing viewport commands like `Visible(true)`.
 /// See <https://github.com/emilk/egui/issues/7776>.
 const INVISIBLE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+fn redraw_uses_cached_paint(paint_only_ready: bool, needs_full_ui: bool) -> bool {
+    paint_only_ready && !needs_full_ui
+}
+
+/// Whether a [`UserEvent::RequestRepaint`] made when `requested_pass_nr`
+/// passes had completed still asks for a pass now that `current_pass_nr`
+/// have: requests made during the pass that just ended still count.
+pub(crate) fn repaint_request_is_current(current_pass_nr: u64, requested_pass_nr: u64) -> bool {
+    current_pass_nr == requested_pass_nr || current_pass_nr == requested_pass_nr + 1
+}
+
+/// Ueye patch (DESIGN.md 9.4): a filtered pointer move asks for no redraw.
+fn filtered_move_result(result: EventResult) -> EventResult {
+    match result {
+        EventResult::RepaintNow(_) | EventResult::RepaintNext(_) => EventResult::Wait,
+        other => other,
+    }
+}
 
 // ----------------------------------------------------------------------------
 fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoop<UserEvent>> {
@@ -79,6 +98,9 @@ fn with_event_loop<R>(
 /// some events, but otherwise forwards events to the [`WinitApp`].
 struct WinitAppWrapper<T: WinitApp> {
     windows_next_repaint_times: HashMap<WindowId, Instant>,
+    windows_next_paint_only_times: HashMap<WindowId, Instant>,
+    paint_only_ready: HashSet<WindowId>,
+    needs_full_ui: HashSet<WindowId>,
     winit_app: T,
     return_result: Result<(), crate::Error>,
     run_and_return: bool,
@@ -88,6 +110,9 @@ impl<T: WinitApp> WinitAppWrapper<T> {
     fn new(winit_app: T, run_and_return: bool) -> Self {
         Self {
             windows_next_repaint_times: HashMap::default(),
+            windows_next_paint_only_times: HashMap::default(),
+            paint_only_ready: HashSet::default(),
+            needs_full_ui: HashSet::default(),
             winit_app,
             return_result: Ok(()),
             run_and_return,
@@ -124,12 +149,16 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             }
             EventResult::RepaintNow(window_id) => {
                 log::trace!("RepaintNow of {window_id:?}");
+                self.paint_only_ready.remove(&window_id);
+                self.windows_next_paint_only_times.remove(&window_id);
                 self.windows_next_repaint_times
                     .insert(window_id, Instant::now());
                 event_result
             }
             EventResult::RepaintNext(window_id) => {
                 log::trace!("RepaintNext of {window_id:?}");
+                self.paint_only_ready.remove(&window_id);
+                self.windows_next_paint_only_times.remove(&window_id);
                 self.windows_next_repaint_times
                     .insert(window_id, Instant::now());
                 event_result
@@ -141,6 +170,14 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                         .get(&window_id)
                         .map_or(repaint_time, |last| (*last).min(repaint_time)),
                 );
+                event_result
+            }
+            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            EventResult::PaintOnlyAt(window_id, repaint_time) => {
+                self.windows_next_paint_only_times
+                    .entry(window_id)
+                    .and_modify(|current| *current = (*current).min(repaint_time))
+                    .or_insert(repaint_time);
                 event_result
             }
             EventResult::Save => {
@@ -190,6 +227,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         let now = Instant::now();
 
         let mut invisible_window_ids = Vec::new();
+        let mut full_ready = HashSet::default();
 
         self.windows_next_repaint_times
             .retain(|window_id, repaint_time| {
@@ -198,6 +236,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                 }
 
                 if let Some(window) = self.winit_app.window(*window_id) {
+                    full_ready.insert(*window_id);
                     // On Windows, invisible windows don't receive RedrawRequested
                     // events, so pending viewport commands (e.g. Visible(true)) would
                     // never be processed. We collect these windows to paint them
@@ -217,6 +256,28 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                     }
                 } else {
                     log::trace!("No window found for {window_id:?}");
+                }
+                false
+            });
+
+        for window_id in &full_ready {
+            self.paint_only_ready.remove(window_id);
+            self.windows_next_paint_only_times.remove(window_id);
+        }
+
+        self.windows_next_paint_only_times
+            .retain(|window_id, repaint_time| {
+                if now < *repaint_time {
+                    return true;
+                }
+                if full_ready.contains(window_id) {
+                    return false;
+                }
+                if let Some(window) = self.winit_app.window(*window_id)
+                    && !is_invisible_or_minimized(&window)
+                {
+                    self.paint_only_ready.insert(*window_id);
+                    window.request_redraw();
                 }
                 false
             });
@@ -247,7 +308,12 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         // `ControlFlow::Poll` set earlier was never undone once the last timed
         // repaint had been consumed, leaving the loop spinning.
         // See https://github.com/emilk/egui/issues/8326.
-        let next_repaint_time = self.windows_next_repaint_times.values().min().copied();
+        let next_repaint_time = self
+            .windows_next_repaint_times
+            .values()
+            .chain(self.windows_next_paint_only_times.values())
+            .min()
+            .copied();
         event_loop.set_control_flow(match next_repaint_time {
             Some(next_repaint_time) => ControlFlow::WaitUntil(next_repaint_time),
             None => ControlFlow::Wait,
@@ -317,9 +383,7 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                         .winit_app
                         .egui_ctx()
                         .map_or(0, |ctx| ctx.cumulative_pass_nr_for(viewport_id));
-                    if current_pass_nr == cumulative_pass_nr
-                        || current_pass_nr == cumulative_pass_nr + 1
-                    {
+                    if repaint_request_is_current(current_pass_nr, cumulative_pass_nr) {
                         log::trace!("UserEvent::RequestRepaint scheduling repaint at {when:?}");
                         if let Some(window_id) =
                             self.winit_app.window_id_from_viewport_id(viewport_id)
@@ -372,13 +436,57 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
         event_loop_context::with_event_loop_context(event_loop, move || {
             let event_result = match event {
                 winit::event::WindowEvent::RedrawRequested => {
-                    self.winit_app.run_ui_and_paint(event_loop, window_id)
+                    let paint_only_ready = self.paint_only_ready.remove(&window_id);
+                    let needs_full_ui = self.needs_full_ui.remove(&window_id);
+                    if redraw_uses_cached_paint(paint_only_ready, needs_full_ui) {
+                        self.winit_app.run_paint_only(event_loop, window_id)
+                    } else {
+                        self.winit_app.run_ui_and_paint(event_loop, window_id)
+                    }
                 }
-                _ => self.winit_app.window_event(event_loop, window_id, event),
+                _ => {
+                    let filtered = self.winit_app.pointer_move_filtered(window_id, &event);
+                    if !filtered {
+                        self.needs_full_ui.insert(window_id);
+                    }
+                    let result = self.winit_app.window_event(event_loop, window_id, event);
+                    if filtered {
+                        result.map(filtered_move_result)
+                    } else {
+                        result
+                    }
+                }
             };
 
             self.handle_event_result(event_loop, event_result);
         });
+    }
+}
+
+#[cfg(test)]
+mod retained_paint_tests {
+    use super::{EventResult, filtered_move_result, redraw_uses_cached_paint};
+
+    #[test]
+    fn input_or_full_redraw_wins_over_an_animation_tick() {
+        assert!(redraw_uses_cached_paint(true, false));
+        assert!(!redraw_uses_cached_paint(true, true));
+        assert!(!redraw_uses_cached_paint(false, false));
+        assert!(!redraw_uses_cached_paint(false, true));
+    }
+
+    #[test]
+    fn a_filtered_pointer_move_requests_no_redraw() {
+        let window = winit::window::WindowId::dummy();
+        for result in [
+            EventResult::RepaintNow(window),
+            EventResult::RepaintNext(window),
+        ] {
+            assert_eq!(filtered_move_result(result), EventResult::Wait);
+        }
+        for result in [EventResult::Wait, EventResult::Save, EventResult::Exit] {
+            assert_eq!(filtered_move_result(result), result);
+        }
     }
 }
 

@@ -90,6 +90,20 @@ impl WebPainter for WebPainterGlow {
         Ok(())
     }
 
+    fn paint_retained(
+        &mut self,
+        clear_color: [f32; 4],
+        clipped_primitives: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+    ) -> Result<(), JsValue> {
+        // Ueye patch: the meshes of the last frame stay uploaded.
+        let canvas_dimension = [self.canvas.width(), self.canvas.height()];
+        egui_glow::painter::clear(self.painter.gl(), canvas_dimension, clear_color);
+        self.painter
+            .paint_primitives_retained(canvas_dimension, pixels_per_point, clipped_primitives);
+        Ok(())
+    }
+
     fn destroy(&mut self) {
         self.painter.destroy();
     }

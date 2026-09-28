@@ -29,6 +29,23 @@ pub fn sleep_if_invisible_or_minimized(window: Option<&Window>) {
     }
 }
 
+/// Ueye patch (DESIGN.md 9.4): where a window event moves the pointer, in
+/// points: `Some(Some(position))` for a move, `Some(None)` when it leaves
+/// the window, `None` for any other event.
+pub fn pointer_move(
+    event: &winit::event::WindowEvent,
+    pixels_per_point: f32,
+) -> Option<Option<egui::Pos2>> {
+    match event {
+        winit::event::WindowEvent::CursorMoved { position, .. } => Some(Some(egui::pos2(
+            position.x as f32 / pixels_per_point,
+            position.y as f32 / pixels_per_point,
+        ))),
+        winit::event::WindowEvent::CursorLeft { .. } => Some(None),
+        _ => None,
+    }
+}
+
 /// Create an egui context, restoring it from storage if possible.
 pub fn create_egui_context(storage: Option<&dyn crate::Storage>) -> egui::Context {
     profiling::function_scope!();
@@ -103,6 +120,27 @@ pub trait WinitApp {
         window_id: WindowId,
     ) -> crate::Result<EventResult>;
 
+    /// Replay retained paint jobs. Renderers without retained frames use a
+    /// regular UI pass instead.
+    fn run_paint_only(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) -> crate::Result<EventResult> {
+        self.run_ui_and_paint(event_loop, window_id)
+    }
+
+    /// Ueye patch (DESIGN.md 9.4): whether `event` is a pointer move that
+    /// needs no UI pass. It is still given to egui; it just runs no pass and
+    /// requests no redraw.
+    fn pointer_move_filtered(
+        &mut self,
+        _window_id: WindowId,
+        _event: &winit::event::WindowEvent,
+    ) -> bool {
+        false
+    }
+
     fn suspended(&mut self, event_loop: &ActiveEventLoop) -> crate::Result<EventResult>;
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) -> crate::Result<EventResult>;
@@ -143,6 +181,10 @@ pub enum EventResult {
     RepaintNext(WindowId),
 
     RepaintAt(WindowId, Instant),
+
+    /// Schedule a paint-only redraw; a normal redraw request takes priority.
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    PaintOnlyAt(WindowId, Instant),
 
     /// Causes a save of the client state when the persistence feature is enabled.
     Save,

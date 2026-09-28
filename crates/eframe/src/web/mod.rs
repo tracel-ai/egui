@@ -381,3 +381,26 @@ pub fn percent_decode(s: &str) -> String {
 pub fn is_safari_browser() -> bool {
     web_sys::window().is_some_and(|window| Object::has_own(&window, &JsValue::from("safari")))
 }
+
+// ----------------------------------------------------------------------------
+// Ueye patch: waking the runner, which only requests frames while one is due.
+
+thread_local! {
+    static WAKER: std::cell::RefCell<Option<WebRunner>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Remembers the runner that repaint requests wake.
+pub(crate) fn set_waker(runner: WebRunner) {
+    WAKER.with(|waker| *waker.borrow_mut() = Some(runner));
+}
+
+/// Asks the runner for an animation frame: a repaint was requested, and the
+/// frame will reschedule itself for the time the repaint is due.
+pub(crate) fn wake() {
+    let runner = WAKER.with(|waker| waker.borrow().clone());
+    if let Some(runner) = runner
+        && let Err(err) = runner.request_animation_frame()
+    {
+        log::error!("Failed to request an animation frame: {err:?}");
+    }
+}

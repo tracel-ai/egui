@@ -6,7 +6,11 @@
 //! like removing a bunch of `unwraps`.
 
 use core::{cell::RefCell, num::NonZeroU32};
-use std::{rc::Rc, sync::Arc, time::Instant};
+use std::{
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use egui_winit::ActionRequested;
 use parking_lot::Mutex;
@@ -61,6 +65,7 @@ pub struct WgpuWinitApp<'app> {
 /// initialized once the application has an associated `SurfaceView`.
 struct WgpuWinitRunning<'app> {
     integration: EpiIntegration,
+    repaint_proxy: Arc<Mutex<EventLoopProxy<UserEvent>>>,
 
     /// The users application.
     app: Box<dyn 'app + App>,
@@ -69,6 +74,84 @@ struct WgpuWinitRunning<'app> {
     shared: Rc<RefCell<SharedState>>,
 
     pending_deltas: TexturesDelta,
+
+    retained_repaint_after:
+        Option<fn(&egui::Context, Option<u32>, bool, Instant) -> Option<core::time::Duration>>,
+    retained_root: Option<RetainedFrame>,
+    monitor_refresh: MonitorRefreshCache,
+}
+
+/// Root viewport paint jobs and the mesh buffers uploaded for them.
+/// A paint-only frame can replay them until a normal UI pass changes state.
+struct RetainedFrame {
+    primitives: Vec<egui::ClippedPrimitive>,
+    pixels_per_point: f32,
+    clear_color: [f32; 4],
+    window_size_px: winit::dpi::PhysicalSize<u32>,
+    surface_config: egui_wgpu::SurfaceConfig,
+    repaint_after: core::time::Duration,
+}
+
+fn retained_paint_deadline(frame_started: Instant, repaint_after: core::time::Duration) -> Instant {
+    // Use the start of the frame. Present can wait for vsync; starting the
+    // interval after it would under-run the display refresh rate.
+    frame_started + repaint_after
+}
+
+fn multipass_repaint_request(
+    output: &FullOutput,
+    viewport_id: ViewportId,
+    completed_pass_nr: u64,
+    frame_started: Instant,
+) -> Option<UserEvent> {
+    if output.platform_output.num_completed_passes < 2 {
+        return None;
+    }
+    let delay = output.viewport_output.get(&viewport_id)?.repaint_delay;
+    if delay == Duration::MAX {
+        return None;
+    }
+    // egui keeps the earliest repaint delay across discarded passes, but its
+    // callback records the pass that requested it. Once a second pass ends,
+    // the event loop can reject that callback as stale. Reissue the combined
+    // frame's deadline using its final pass, preserving delayed UI updates
+    // while retained GPU paints continue between them.
+    Some(UserEvent::RequestRepaint {
+        viewport_id,
+        when: frame_started + delay,
+        cumulative_pass_nr: completed_pass_nr.saturating_sub(1),
+    })
+}
+
+/// Refresh-rate lookup can be relatively expensive on some hosts (notably
+/// macOS), so retained frames share the last answer for up to two seconds.
+#[derive(Default)]
+struct MonitorRefreshCache {
+    refresh_millihertz: Option<u32>,
+    sampled_at: Option<Instant>,
+}
+
+impl MonitorRefreshCache {
+    const MAX_AGE: Duration = Duration::from_secs(2);
+
+    fn get_or_sample(&mut self, now: Instant, sample: impl FnOnce() -> Option<u32>) -> Option<u32> {
+        if self
+            .sampled_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= Self::MAX_AGE)
+        {
+            self.refresh_millihertz = sample().filter(|rate| *rate > 0);
+            self.sampled_at = Some(now);
+        }
+        self.refresh_millihertz
+    }
+
+    fn for_window(&mut self, window: &Window) -> Option<u32> {
+        self.get_or_sample(Instant::now(), || {
+            window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz())
+        })
+    }
 }
 
 impl Drop for WgpuWinitRunning<'_> {
@@ -262,7 +345,7 @@ impl<'app> WgpuWinitApp<'app> {
 
         let wgpu_render_state = painter.render_state();
 
-        let integration = EpiIntegration::new(
+        let mut integration = EpiIntegration::new(
             egui_ctx.clone(),
             &window,
             &self.app_name,
@@ -277,20 +360,9 @@ impl<'app> WgpuWinitApp<'app> {
 
         {
             let event_loop_proxy = Arc::clone(&self.repaint_proxy);
-
-            egui_ctx.set_request_repaint_callback(move |info| {
-                log::trace!("request_repaint_callback: {info:?}");
-                let when = Instant::now() + info.delay;
-                let cumulative_pass_nr = info.current_cumulative_pass_nr;
-
-                event_loop_proxy
-                    .lock()
-                    .send_event(UserEvent::RequestRepaint {
-                        when,
-                        cumulative_pass_nr,
-                        viewport_id: info.viewport_id,
-                    })
-                    .ok();
+            // Ueye patch: shared with glow, see `RepaintWatch`.
+            integration.install_repaint_callbacks(move |event| {
+                event_loop_proxy.lock().send_event(event).ok();
             });
         }
 
@@ -378,9 +450,13 @@ impl<'app> WgpuWinitApp<'app> {
 
         Ok(self.running.insert(WgpuWinitRunning {
             integration,
+            repaint_proxy: Arc::clone(&self.repaint_proxy),
             app,
             shared,
             pending_deltas: Default::default(),
+            retained_repaint_after: self.native_options.retained_repaint_after,
+            retained_root: None,
+            monitor_refresh: MonitorRefreshCache::default(),
         }))
     }
 }
@@ -437,6 +513,20 @@ impl WinitApp for WgpuWinitApp<'_> {
 
         if let Some(running) = &mut self.running {
             running.run_ui_and_paint(window_id, event_loop)
+        } else {
+            Ok(EventResult::Wait)
+        }
+    }
+
+    fn run_paint_only(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) -> crate::Result<EventResult> {
+        self.initialized_all_windows(event_loop);
+
+        if let Some(running) = &mut self.running {
+            running.run_paint_only(window_id, event_loop)
         } else {
             Ok(EventResult::Wait)
         }
@@ -516,12 +606,59 @@ impl WinitApp for WgpuWinitApp<'_> {
                 if let Some(egui_winit) = viewport.egui_winit.as_mut()
                     && egui_winit.on_mouse_motion(delta)
                 {
+                    // Ueye patch (DESIGN.md 9.4): with pointer filtering, raw
+                    // motion runs no pass by itself unless a button is held;
+                    // the window's own pointer moves decide.
+                    if self.native_options.pointer_move_needs_ui_pass.is_some()
+                        && !egui_winit.is_any_pointer_button_down()
+                    {
+                        crate::pointer_filter::merge_mouse_motion(egui_winit.egui_input_mut());
+                        return Ok(EventResult::Wait);
+                    }
                     return Ok(EventResult::RepaintNext(window.id()));
                 }
             }
         }
 
         Ok(EventResult::Wait)
+    }
+
+    fn pointer_move_filtered(
+        &mut self,
+        window_id: WindowId,
+        event: &winit::event::WindowEvent,
+    ) -> bool {
+        let (Some(needs_ui_pass), Some(running)) = (
+            self.native_options.pointer_move_needs_ui_pass,
+            &mut self.running,
+        ) else {
+            return false;
+        };
+        let egui_ctx = &running.integration.egui_ctx;
+        let mut shared = running.shared.borrow_mut();
+        let SharedState {
+            viewport_from_window,
+            viewports,
+            ..
+        } = &mut *shared;
+        if viewport_from_window.get(&window_id) != Some(&ViewportId::ROOT) {
+            return false;
+        }
+        let Some(viewport) = viewports.get_mut(&ViewportId::ROOT) else {
+            return false;
+        };
+        let (Some(window), Some(egui_winit)) = (&viewport.window, &mut viewport.egui_winit) else {
+            return false;
+        };
+        let pixels_per_point = egui_winit::pixels_per_point(egui_ctx, window);
+        let Some(pointer) = winit_integration::pointer_move(event, pixels_per_point) else {
+            return false;
+        };
+        if needs_ui_pass(egui_ctx, pointer) {
+            return false;
+        }
+        crate::pointer_filter::drop_superseded_pointer_move(egui_winit.egui_input_mut());
+        true
     }
 
     fn window_event(
@@ -595,6 +732,99 @@ impl WgpuWinitRunning<'_> {
         shared.painter.destroy();
     }
 
+    fn run_paint_only(
+        &mut self,
+        window_id: WindowId,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<EventResult> {
+        let can_replay = {
+            let shared = self.shared.borrow();
+            let Some(viewport_id) = shared.viewport_from_window.get(&window_id) else {
+                return Ok(EventResult::Wait);
+            };
+            let Some(viewport) = shared.viewports.get(viewport_id) else {
+                return Ok(EventResult::Wait);
+            };
+            let Some(window) = viewport.window.as_ref() else {
+                return Ok(EventResult::Wait);
+            };
+            *viewport_id == ViewportId::ROOT
+                && self.retained_root.as_ref().is_some_and(|frame| {
+                    window.inner_size() == frame.window_size_px
+                        && self.integration.egui_ctx.pixels_per_point() == frame.pixels_per_point
+                        && shared.painter.can_replay_cached_meshes(
+                            ViewportId::ROOT,
+                            [frame.window_size_px.width, frame.window_size_px.height],
+                            frame.surface_config,
+                        )
+                })
+                && viewport.info.visible().unwrap_or(true)
+                && viewport.info.events.is_empty()
+                && viewport.egui_winit.as_ref().is_some_and(|state| {
+                    let input = state.egui_input();
+                    crate::pointer_filter::only_pointer_moves(&input.events)
+                        && input.hovered_files.is_empty()
+                        && input.dropped_files.is_empty()
+                })
+                && viewport.pending_delta.set.is_empty()
+                && viewport.pending_delta.free.is_empty()
+                && viewport.actions_requested.is_empty()
+                && self.pending_deltas.set.is_empty()
+                && self.pending_deltas.free.is_empty()
+                && !self.integration.retained_paint_needs_full_ui()
+        };
+        if !can_replay {
+            self.retained_root = None;
+            return self.run_ui_and_paint(window_id, event_loop);
+        }
+
+        profiling::scope!("retained_paint_only");
+        let frame_timer = Instant::now();
+        let mut shared = self.shared.borrow_mut();
+        let SharedState {
+            viewports, painter, ..
+        } = &mut *shared;
+        let Some(window) = viewports
+            .get(&ViewportId::ROOT)
+            .and_then(|viewport| viewport.window.as_ref())
+        else {
+            return Ok(EventResult::Wait);
+        };
+        let frame = self.retained_root.as_ref().expect("checked above");
+        let mut no_texture_changes = TexturesDelta::default();
+        let vsync_secs = painter.paint_with_cached_meshes(
+            ViewportId::ROOT,
+            frame.pixels_per_point,
+            frame.clear_color,
+            &frame.primitives,
+            &mut no_texture_changes,
+            vec![],
+            window,
+        );
+        self.integration.post_rendering(window);
+        self.integration
+            .report_frame_time(frame_timer.elapsed().as_secs_f32() - vsync_secs);
+        self.integration
+            .maybe_autosave(self.app.as_mut(), Some(window.as_ref()));
+        let repaint_after = self.retained_repaint_after.and_then(|cadence| {
+            cadence(
+                &self.integration.egui_ctx,
+                self.monitor_refresh.for_window(window),
+                true,
+                frame_timer,
+            )
+        });
+        if let Some(repaint_after) = repaint_after {
+            Ok(EventResult::PaintOnlyAt(
+                window_id,
+                retained_paint_deadline(frame_timer, repaint_after),
+            ))
+        } else {
+            self.retained_root = None;
+            Ok(EventResult::Wait)
+        }
+    }
+
     /// This is called both for the root viewport, and all deferred viewports
     fn run_ui_and_paint(
         &mut self,
@@ -602,6 +832,7 @@ impl WgpuWinitRunning<'_> {
         event_loop: &ActiveEventLoop,
     ) -> Result<EventResult> {
         profiling::function_scope!();
+        let frame_started = Instant::now();
 
         let Some(viewport_id) = self
             .shared
@@ -618,9 +849,19 @@ impl WgpuWinitRunning<'_> {
         let Self {
             app,
             integration,
+            repaint_proxy,
             shared,
             pending_deltas,
+            retained_repaint_after,
+            retained_root,
+            monitor_refresh,
         } = self;
+
+        if viewport_id != ViewportId::ROOT {
+            // egui-wgpu shares one mesh buffer across viewports. Rendering any
+            // other viewport replaces the root's retained mesh slices.
+            *retained_root = None;
+        }
 
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
@@ -697,6 +938,7 @@ impl WgpuWinitRunning<'_> {
         };
 
         if !show_ui {
+            *retained_root = None;
             // Nothing will be shown, so we run no egui pass at all.
             // That way all ui state is left untouched, and is still there
             // when this viewport becomes visible again.
@@ -754,6 +996,18 @@ impl WgpuWinitRunning<'_> {
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+        // A root pass under the `RepaintWatch` posted the repaint of its
+        // last pass already.
+        if (integration.repaint_watch.is_none() || viewport_id != ViewportId::ROOT)
+            && let Some(request) = multipass_repaint_request(
+                &full_output,
+                viewport_id,
+                integration.egui_ctx.cumulative_pass_nr_for(viewport_id),
+                frame_started,
+            )
+        {
+            repaint_proxy.lock().send_event(request).ok();
+        }
 
         // ------------------------------------------------------------
 
@@ -808,15 +1062,45 @@ impl WgpuWinitRunning<'_> {
                     true
                 }
             });
+            let clear_color = app.clear_color(&egui_ctx.global_style().visuals);
+            let surface_config = painter.surface_config();
+            let can_retain = viewport_id == ViewportId::ROOT
+                && window.inner_size().width > 0
+                && window.inner_size().height > 0
+                && pending_deltas.free.is_empty()
+                && screenshot_commands.is_empty()
+                && surface_config.is_some();
             let vsync_secs = painter.paint_and_update_textures(
                 viewport_id,
                 pixels_per_point,
-                app.clear_color(&egui_ctx.global_style().visuals),
+                clear_color,
                 &clipped_primitives,
                 pending_deltas,
                 screenshot_commands,
                 window,
             );
+
+            *retained_root = if can_retain {
+                retained_repaint_after
+                    .and_then(|cadence| {
+                        cadence(
+                            egui_ctx,
+                            monitor_refresh.for_window(window),
+                            false,
+                            frame_started,
+                        )
+                    })
+                    .map(|repaint_after| RetainedFrame {
+                        primitives: clipped_primitives,
+                        pixels_per_point,
+                        clear_color,
+                        window_size_px: window.inner_size(),
+                        surface_config: surface_config.expect("checked above"),
+                        repaint_after,
+                    })
+            } else {
+                None
+            };
 
             for action in viewport.actions_requested.drain(..) {
                 match action {
@@ -847,6 +1131,7 @@ impl WgpuWinitRunning<'_> {
 
             vsync_secs
         } else {
+            *retained_root = None;
             0.0
         };
 
@@ -865,6 +1150,10 @@ impl WgpuWinitRunning<'_> {
         viewport_from_window.retain(|_, id| active_viewports_ids.contains(id));
         painter.gc_viewports(&active_viewports_ids);
 
+        if viewports.len() > 1 {
+            *retained_root = None;
+        }
+
         let window = viewport_from_window
             .get(&window_id)
             .and_then(|id| viewports.get(id))
@@ -878,6 +1167,29 @@ impl WgpuWinitRunning<'_> {
 
         if integration.should_close() {
             Ok(EventResult::CloseRequested)
+        } else if viewport_id == ViewportId::ROOT
+            && let Some(frame) = retained_root.as_ref()
+        {
+            Ok(EventResult::PaintOnlyAt(
+                window_id,
+                retained_paint_deadline(frame_started, frame.repaint_after),
+            ))
+        } else if viewport_id == ViewportId::ROOT
+            && let Some(cadence) = retained_repaint_after.and_then(|cadence| {
+                cadence(
+                    egui_ctx,
+                    window.and_then(|window| monitor_refresh.for_window(window)),
+                    false,
+                    frame_started,
+                )
+            })
+        {
+            // If a transient texture, screenshot, or extra viewport prevents
+            // retention, keep the animation alive with a regular egui frame.
+            Ok(EventResult::RepaintAt(
+                window_id,
+                retained_paint_deadline(frame_started, cadence),
+            ))
         } else {
             Ok(EventResult::Wait)
         }
@@ -890,12 +1202,27 @@ impl WgpuWinitRunning<'_> {
     ) -> EventResult {
         let Self {
             integration,
+            app,
             shared,
             ..
         } = self;
         let mut shared = shared.borrow_mut();
 
         let viewport_id = shared.viewport_from_window.get(&window_id).copied();
+
+        if viewport_id == Some(ViewportId::ROOT)
+            && let winit::event::WindowEvent::PinchGesture { delta, phase, .. } = event
+        {
+            app.on_native_pinch(
+                *delta,
+                match phase {
+                    winit::event::TouchPhase::Started => egui::TouchPhase::Start,
+                    winit::event::TouchPhase::Moved => egui::TouchPhase::Move,
+                    winit::event::TouchPhase::Ended => egui::TouchPhase::End,
+                    winit::event::TouchPhase::Cancelled => egui::TouchPhase::Cancel,
+                },
+            );
+        }
 
         // On Windows, if a window is resized by the user, it should repaint synchronously, inside the
         // event handler. If this is not done, the compositor will assume that the window does not want
@@ -1254,6 +1581,146 @@ fn render_immediate_viewport(
         painter,
         viewport_from_window,
     );
+}
+
+#[cfg(test)]
+mod retained_paint_tests {
+    use super::{
+        MonitorRefreshCache, UserEvent, multipass_repaint_request, retained_paint_deadline,
+    };
+    use crate::native::epi_integration::retained_paint_needs_full_ui;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn delayed_repaint_survives_a_discarded_egui_pass() {
+        let ctx = egui::Context::default();
+        for _ in 0..4 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            output.textures_delta.clear();
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        ctx.set_request_repaint_callback(move |request| {
+            captured.lock().unwrap().push(request);
+        });
+
+        let mut pass = 0;
+        let frame_started = Instant::now();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            if pass == 0 {
+                ui.ctx().request_repaint_after(Duration::from_millis(40));
+                ui.ctx().request_discard("verify multipass repaint deadline");
+            }
+            pass += 1;
+        });
+        output.textures_delta.clear();
+        assert_eq!(pass, 2);
+        let completed_pass_nr = ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
+        let original_request = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|request| request.delay > Duration::ZERO)
+            .expect("first pass requested a delayed repaint");
+        assert_eq!(
+            completed_pass_nr,
+            original_request.current_cumulative_pass_nr + 2,
+            "the event loop would reject the first-pass callback as stale"
+        );
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        let recovered = multipass_repaint_request(
+            &output,
+            egui::ViewportId::ROOT,
+            completed_pass_nr,
+            frame_started,
+        )
+        .expect("the combined output retains the first pass's deadline");
+        match recovered {
+            UserEvent::RequestRepaint {
+                when,
+                cumulative_pass_nr,
+                viewport_id,
+            } => {
+                assert_eq!(when, frame_started + delay);
+                assert_eq!(cumulative_pass_nr + 1, completed_pass_nr);
+                assert_eq!(viewport_id, egui::ViewportId::ROOT);
+            }
+            #[cfg(feature = "accesskit")]
+            UserEvent::AccessKitActionRequest(_) => panic!("expected a repaint request"),
+        }
+    }
+
+    #[test]
+    fn present_wait_does_not_add_a_second_frame_interval() {
+        let frame_started = Instant::now();
+        let cadence = Duration::from_secs_f64(1.0 / 120.0);
+        let frame_finished = frame_started + Duration::from_secs_f64(1.0 / 60.0);
+        assert_eq!(
+            retained_paint_deadline(frame_started, cadence),
+            frame_started + cadence
+        );
+        assert!(retained_paint_deadline(frame_started, cadence) < frame_finished);
+    }
+
+    #[test]
+    fn delayed_ui_timer_does_not_prevent_cached_gpu_paint() {
+        let ctx = egui::Context::default();
+        for _ in 0..4 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            output.textures_delta.clear();
+        }
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().request_repaint_after(Duration::from_secs(10));
+        });
+        output.textures_delta.clear();
+        assert!(ctx.has_requested_repaint_for(&egui::ViewportId::ROOT));
+        assert!(!retained_paint_needs_full_ui(&ctx, None));
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().request_repaint();
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(retained_paint_needs_full_ui(&ctx, None));
+    }
+
+    #[test]
+    fn monitor_refresh_is_queried_at_most_once_per_two_seconds() {
+        let mut cache = MonitorRefreshCache::default();
+        let start = Instant::now();
+        assert_eq!(cache.get_or_sample(start, || Some(120_000)), Some(120_000));
+        assert_eq!(
+            cache.get_or_sample(start + Duration::from_secs(1), || {
+                panic!("refresh rate queried before cache expired")
+            }),
+            Some(120_000)
+        );
+        assert_eq!(
+            cache.get_or_sample(start + Duration::from_secs(2), || Some(60_000)),
+            Some(60_000)
+        );
+    }
+
+    #[test]
+    fn unavailable_monitor_refresh_is_cached_and_zero_is_ignored() {
+        let mut cache = MonitorRefreshCache::default();
+        let start = Instant::now();
+        assert_eq!(cache.get_or_sample(start, || None), None);
+        assert_eq!(
+            cache.get_or_sample(start + Duration::from_secs(1), || {
+                panic!("unavailable result queried before cache expired")
+            }),
+            None
+        );
+        assert_eq!(
+            cache.get_or_sample(start + Duration::from_secs(2), || Some(0)),
+            None
+        );
+    }
 }
 
 pub(crate) fn remove_viewports_not_in(

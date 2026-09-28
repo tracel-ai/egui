@@ -33,6 +33,10 @@ pub struct WebRunner {
     /// Current animation frame in flight.
     frame: Rc<RefCell<Option<AnimationFrameRequest>>>,
 
+    /// Ueye patch: a timer waiting to request a later frame (its host time
+    /// in `now_sec` scale, id and closure).
+    timer: Rc<RefCell<Option<(f64, i32, Closure<dyn FnMut()>)>>>,
+
     resize_observer: Rc<RefCell<Option<ResizeObserverContext>>>,
 }
 
@@ -47,6 +51,7 @@ impl WebRunner {
             app_runner: Rc::new(RefCell::new(None)),
             events_to_unsubscribe: Rc::new(RefCell::new(Default::default())),
             frame: Default::default(),
+            timer: Default::default(),
             resize_observer: Default::default(),
         }
     }
@@ -90,6 +95,9 @@ impl WebRunner {
         }
 
         events::install_event_handlers(self)?;
+        // Ueye patch: repaint requests wake the runner, which otherwise only
+        // asks for frames while one is due.
+        super::set_waker(self.clone());
 
         log::info!("event handlers installed.");
 
@@ -205,6 +213,12 @@ impl WebRunner {
                 // Cast the event to the expected event type
                 let event = event.unchecked_into::<E>();
                 closure(event, &mut runner_lock, &web_runner);
+                // Ueye patch: an event may need a frame; the loop is idle at rest.
+                let next = runner_lock.next_frame_time();
+                drop(runner_lock);
+                if let Err(err) = web_runner.schedule_frame(next) {
+                    log::error!("Failed to schedule a frame: {err:?}");
+                }
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
 
@@ -227,6 +241,45 @@ impl WebRunner {
             .borrow_mut()
             .push(EventToUnsubscribe::TargetEvent(handle));
 
+        Ok(())
+    }
+
+    /// Ueye patch: schedules the frame due at `next` (`now_sec` scale): an
+    /// animation frame when it is due now, a timer that requests one when it
+    /// is due later, and nothing at rest (`next` is infinite).
+    pub(crate) fn schedule_frame(&self, next: f64) -> Result<(), wasm_bindgen::JsValue> {
+        if next == f64::INFINITY || next.is_nan() {
+            return Ok(());
+        }
+        let now = super::now_sec();
+        if next <= now + 0.001 {
+            return self.request_animation_frame();
+        }
+        if self
+            .timer
+            .borrow()
+            .as_ref()
+            .is_some_and(|(when, _, _)| *when <= next)
+        {
+            return Ok(());
+        }
+        let window = web_sys::window().unwrap();
+        if let Some((_, id, _)) = self.timer.borrow_mut().take() {
+            window.clear_timeout_with_handle(id);
+        }
+        let web_runner = self.clone();
+        let closure = Closure::wrap(Box::new(move || {
+            let _ = web_runner.timer.borrow_mut().take();
+            if let Err(err) = web_runner.request_animation_frame() {
+                log::error!("Failed to request an animation frame: {err:?}");
+            }
+        }) as Box<dyn FnMut()>);
+        let delay_ms = ((next - now) * 1000.0).ceil().clamp(0.0, f64::from(i32::MAX)) as i32;
+        let id = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            delay_ms,
+        )?;
+        self.timer.borrow_mut().replace((next, id, closure));
         Ok(())
     }
 

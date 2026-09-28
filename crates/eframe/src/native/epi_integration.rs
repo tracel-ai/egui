@@ -2,6 +2,7 @@
 
 use web_time::Instant;
 
+use core::time::Duration;
 use std::{path::PathBuf, sync::Arc};
 use winit::event_loop::ActiveEventLoop;
 
@@ -10,6 +11,7 @@ use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
 use egui::{DeferredViewportUiCallback, ViewportBuilder, ViewportId};
 use egui_winit::{EventResponse, WindowSettings};
 
+use super::winit_integration::UserEvent;
 use crate::epi;
 
 #[cfg_attr(target_os = "ios", allow(dead_code, unused_variables, unused_mut))]
@@ -147,6 +149,216 @@ pub fn create_storage_with_file(_file: impl Into<PathBuf>) -> Option<Box<dyn epi
 
 // ----------------------------------------------------------------------------
 
+/// Ueye patch (DESIGN.md 9.8): schedules the root viewport's passes under
+/// `NativeOptions::one_pass_per_input`.
+///
+/// egui asks for an immediate repaint whenever a pass had input, and every
+/// immediate request costs two more passes. Under the watch, a root pass
+/// settles in that pass: nothing it asks for is posted to the event loop
+/// while it runs; after it, one repaint is posted for what the app and its
+/// plugins asked for while it ran, keeping egui's own follow-up only while
+/// scrolling, touching, dragging or hovering files. Other threads, and any
+/// request between passes, still wake the event loop right away (from egui's
+/// repaint observer: egui's request callback only sees the requests sooner
+/// than the delay it last scheduled, which the watch may have dropped).
+#[derive(Debug)]
+pub struct RepaintWatch {
+    state: parking_lot::Mutex<WatchState>,
+}
+
+#[derive(Debug)]
+struct WatchState {
+    /// The thread running the root pass, while it runs.
+    pass_thread: Option<std::thread::ThreadId>,
+
+    /// When the pass started.
+    started: Instant,
+
+    /// The app's closure has started (egui's own `begin_pass` requests come before).
+    logic: bool,
+
+    /// Soonest delay the pass asked for since the app's closure started, or
+    /// egui's own non-zero requests.
+    soonest: Duration,
+
+    /// The soonest repaint posted since the last root pass began.
+    posted: Option<Instant>,
+}
+
+impl Default for RepaintWatch {
+    fn default() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(WatchState {
+                pass_thread: None,
+                started: Instant::now(),
+                logic: false,
+                soonest: Duration::MAX,
+                posted: None,
+            }),
+        }
+    }
+}
+
+impl WatchState {
+    /// The event that wakes the event loop at `when`, unless a sooner one
+    /// was already posted.
+    fn post(&mut self, when: Instant, cumulative_pass_nr: u64) -> Option<UserEvent> {
+        if self.posted.is_some_and(|posted| posted <= when) {
+            return None;
+        }
+        self.posted = Some(when);
+        Some(UserEvent::RequestRepaint {
+            viewport_id: ViewportId::ROOT,
+            when,
+            cumulative_pass_nr,
+        })
+    }
+}
+
+impl RepaintWatch {
+    /// Handles a request egui's repaint observer sees: records the ones the
+    /// running root pass makes, and returns the event to post for the others.
+    pub fn observe(&self, info: egui::RequestRepaintInfo) -> Option<UserEvent> {
+        if info.viewport_id != ViewportId::ROOT {
+            return None; // egui's request callback posts it
+        }
+        let mut state = self.state.lock();
+        if state.pass_thread == Some(std::thread::current().id()) {
+            if state.logic || !info.delay.is_zero() {
+                state.soonest = state.soonest.min(info.delay);
+            }
+            return None;
+        }
+        let when = Instant::now().checked_add(info.delay)?;
+        state.post(when, info.current_cumulative_pass_nr)
+    }
+
+    /// Whether egui's request callback posts `info`: the watch posts the
+    /// root's requests.
+    pub fn callback_posts(watch: Option<&Self>, info: &egui::RequestRepaintInfo) -> bool {
+        watch.is_none() || info.viewport_id != ViewportId::ROOT
+    }
+
+    /// Runs a root pass under the watch, as [`EpiIntegration::update`] does:
+    /// returns its output, whose root `repaint_delay` is the one scheduled,
+    /// and the event to post for it.
+    pub fn run_ui(
+        &self,
+        egui_ctx: &egui::Context,
+        raw_input: egui::RawInput,
+        mut run_ui: impl FnMut(&mut egui::Ui),
+    ) -> (egui::FullOutput, Option<UserEvent>) {
+        {
+            let mut state = self.state.lock();
+            state.pass_thread = Some(std::thread::current().id());
+            state.started = Instant::now();
+            state.logic = false;
+            state.soonest = Duration::MAX;
+            // egui forgets the delay it scheduled when a pass begins, too.
+            state.posted = None;
+        }
+        let mut full_output = egui_ctx.run_ui(raw_input, |ui| {
+            self.state.lock().logic = true;
+            run_ui(ui);
+        });
+        let needs_follow_up = egui_ctx.input(input_needs_follow_up);
+        // The pass that ended is the one before this number, which the event
+        // loop accepts as current.
+        let pass_nr = egui_ctx
+            .cumulative_pass_nr_for(ViewportId::ROOT)
+            .saturating_sub(1);
+
+        let mut state = self.state.lock();
+        state.pass_thread = None;
+        let root = full_output.viewport_output.get_mut(&ViewportId::ROOT);
+        let egui_delay = root
+            .as_ref()
+            .map_or(Duration::MAX, |root| root.repaint_delay);
+        let delay = if egui_delay.is_zero() && !needs_follow_up {
+            state.soonest
+        } else {
+            egui_delay
+        };
+        if let Some(root) = root {
+            root.repaint_delay = delay;
+        }
+        let request = state
+            .started
+            .checked_add(delay)
+            .and_then(|when| state.post(when, pass_nr));
+        (full_output, request)
+    }
+
+    /// Before a logic-only run of the root (the window is hidden): egui
+    /// forgets the delay it scheduled, and so does the watch.
+    fn begin_logic_only(&self) {
+        self.state.lock().posted = None;
+    }
+
+    /// Whether a repaint posted since the last root pass began is due.
+    fn repaint_due(&self, now: Instant) -> bool {
+        self.state.lock().posted.is_some_and(|when| when <= now)
+    }
+}
+
+/// Ueye patch: installs egui's request callback, and the repaint observer of
+/// `watch`; both hand the events to post to `post`, which is returned for
+/// the requests the watch posts after a pass.
+pub fn install_repaint_callbacks(
+    egui_ctx: &egui::Context,
+    watch: Option<Arc<RepaintWatch>>,
+    post: impl Fn(UserEvent) + Send + Sync + 'static,
+) -> Arc<dyn Fn(UserEvent) + Send + Sync> {
+    let post: Arc<dyn Fn(UserEvent) + Send + Sync> = Arc::new(post);
+    if let Some(watch) = watch.clone() {
+        let post = Arc::clone(&post);
+        egui_ctx.set_repaint_observer(move |info| {
+            if let Some(event) = watch.observe(info) {
+                post(event);
+            }
+        });
+    }
+    let callback_post = Arc::clone(&post);
+    egui_ctx.set_request_repaint_callback(move |info| {
+        log::trace!("request_repaint_callback: {info:?}");
+        if RepaintWatch::callback_posts(watch.as_deref(), &info) {
+            callback_post(UserEvent::RequestRepaint {
+                when: Instant::now() + info.delay,
+                cumulative_pass_nr: info.current_cumulative_pass_nr,
+                viewport_id: info.viewport_id,
+            });
+        }
+    });
+    post
+}
+
+/// Ueye patch: whether a retained paint-only frame must give way to a full
+/// UI pass because a repaint was asked for.
+pub fn retained_paint_needs_full_ui(
+    egui_ctx: &egui::Context,
+    watch: Option<&RepaintWatch>,
+) -> bool {
+    match watch {
+        // egui's own flag describes the pass before the last one, and stays
+        // set after the input passes whose follow-up the watch dropped.
+        Some(watch) => watch.repaint_due(Instant::now()),
+        // A future `request_repaint_after` also makes `has_requested_repaint_for`
+        // true. The event loop already tracks that deadline and prioritizes its
+        // full repaint when due. Forcing a UI pass on every paint-only animation
+        // tick until then would defeat mesh retention.
+        None => egui_ctx.requested_repaint_last_pass_for(&ViewportId::ROOT),
+    }
+}
+
+/// Ueye patch: whether egui's own follow-up of an input pass is still
+/// needed: something keeps moving without new input.
+fn input_needs_follow_up(input: &egui::InputState) -> bool {
+    input.is_scrolling()
+        || input.any_touches()
+        || input.pointer.any_down()
+        || !input.raw.hovered_files.is_empty()
+}
+
 /// Everything needed to make a winit-based integration for [`epi`].
 ///
 /// Only one instance per app (not one per viewport).
@@ -170,6 +382,13 @@ pub struct EpiIntegration {
     #[cfg(feature = "persistence")]
     persist_window: bool,
     app_icon_setter: super::app_icon::AppTitleIconSetter,
+
+    /// Ueye patch: see [`RepaintWatch`]; `None` keeps egui's scheduling.
+    pub repaint_watch: Option<Arc<RepaintWatch>>,
+
+    /// Ueye patch: posts repaint requests to the event loop (see
+    /// [`Self::install_repaint_callbacks`]).
+    repaint_post: Option<Arc<dyn Fn(UserEvent) + Send + Sync>>,
 }
 
 impl EpiIntegration {
@@ -227,12 +446,31 @@ impl EpiIntegration {
             #[cfg(feature = "persistence")]
             persist_window: native_options.persist_window,
             app_icon_setter,
+            repaint_watch: native_options
+                .one_pass_per_input
+                .then(|| Arc::new(RepaintWatch::default())),
+            repaint_post: None,
             beginning: Instant::now()
                 .checked_sub(web_time::Duration::from_secs_f64(egui_ctx.time()))
                 .unwrap_or_else(Instant::now),
             is_first_frame: true,
             egui_ctx,
         }
+    }
+
+    /// Ueye patch: installs egui's repaint callbacks, which wake the event
+    /// loop through `post` (see [`install_repaint_callbacks`]).
+    pub fn install_repaint_callbacks(&mut self, post: impl Fn(UserEvent) + Send + Sync + 'static) {
+        self.repaint_post = Some(install_repaint_callbacks(
+            &self.egui_ctx,
+            self.repaint_watch.clone(),
+            post,
+        ));
+    }
+
+    /// Ueye patch: see [`retained_paint_needs_full_ui`].
+    pub fn retained_paint_needs_full_ui(&self) -> bool {
+        retained_paint_needs_full_ui(&self.egui_ctx, self.repaint_watch.as_deref())
     }
 
     /// If `true`, it is time to close the native window.
@@ -285,7 +523,8 @@ impl EpiIntegration {
 
         let is_root_viewport = viewport_ui_cb.is_none();
 
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+        let frame = &mut self.frame;
+        let run_ui = |ui: &mut egui::Ui| {
             if let Some(viewport_ui_cb) = viewport_ui_cb {
                 // Child viewport
                 profiling::scope!("viewport_callback");
@@ -293,14 +532,26 @@ impl EpiIntegration {
             } else {
                 {
                     profiling::scope!("App::logic");
-                    app.logic(ui.ctx(), &mut self.frame);
+                    app.logic(ui.ctx(), frame);
                 }
                 {
                     profiling::scope!("App::ui");
-                    app.ui(ui, &mut self.frame);
+                    app.ui(ui, frame);
                 }
             }
-        });
+        };
+        // Ueye patch: a root pass runs under the watch, which schedules the
+        // next one (see [`RepaintWatch`]).
+        let full_output = match self.repaint_watch.as_ref().filter(|_| is_root_viewport) {
+            Some(watch) => {
+                let (full_output, request) = watch.run_ui(&self.egui_ctx, raw_input, run_ui);
+                if let (Some(request), Some(post)) = (request, &self.repaint_post) {
+                    post(request);
+                }
+                full_output
+            }
+            None => self.egui_ctx.run_ui(raw_input, run_ui),
+        };
 
         if is_root_viewport && close_requested {
             let canceled = full_output.viewport_output[&ViewportId::ROOT]
@@ -329,6 +580,9 @@ impl EpiIntegration {
 
         let close_requested = raw_input.viewport().close_requested();
 
+        if let Some(watch) = &self.repaint_watch {
+            watch.begin_logic_only();
+        }
         let logic_output = self.egui_ctx.run_logic(&raw_input, |ctx| {
             profiling::scope!("App::logic");
             app.logic(ctx, &mut self.frame);
@@ -464,4 +718,243 @@ pub fn load_egui_memory(_storage: Option<&dyn epi::Storage>) -> Option<egui::Mem
     }
     #[cfg(not(feature = "persistence"))]
     None
+}
+
+#[cfg(test)]
+mod one_pass_per_input_tests {
+    //! Ueye patch: with `one_pass_per_input`, the native integrations wake
+    //! the event loop once after a root pass, for what the app asked for
+    //! while it ran (DESIGN.md 9.8).
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "the tests ask for repaints as an app does"
+    )]
+
+    use super::{RepaintWatch, install_repaint_callbacks, retained_paint_needs_full_ui};
+    use crate::native::{run::repaint_request_is_current, winit_integration::UserEvent};
+    use core::time::Duration;
+    use egui::{Event, Modifiers, MouseWheelUnit, RawInput, TouchPhase, ViewportId, pos2, vec2};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    /// A root viewport run as the native integrations run it, keeping the
+    /// repaint requests they post to the event loop.
+    struct Root {
+        ctx: egui::Context,
+        watch: Arc<RepaintWatch>,
+        posted: Arc<Mutex<Vec<UserEvent>>>,
+    }
+
+    impl Root {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let watch = Arc::new(RepaintWatch::default());
+            let posted = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&posted);
+            install_repaint_callbacks(&ctx, Some(Arc::clone(&watch)), move |event| {
+                sink.lock().expect("posted lock").push(event);
+            });
+            let root = Self { ctx, watch, posted };
+            // Past egui's start-up passes.
+            for _ in 0..4 {
+                root.pass(RawInput::default(), |_| {});
+            }
+            root
+        }
+
+        /// Runs a root pass as `EpiIntegration::update` does; returns the
+        /// repaints posted during and after it that the event loop accepts.
+        fn pass(&self, input: RawInput, mut app: impl FnMut(&mut egui::Ui)) -> Vec<Duration> {
+            let started = Instant::now();
+            let (mut output, request) = self.watch.run_ui(&self.ctx, input, |ui| app(ui));
+            output.textures_delta.clear();
+            if let Some(request) = request {
+                self.posted.lock().expect("posted lock").push(request);
+            }
+            self.take(started)
+        }
+
+        /// The repaints posted since the last call that the event loop
+        /// (`run.rs`) accepts now, as delays from `since`.
+        fn take(&self, since: Instant) -> Vec<Duration> {
+            let current = self.ctx.cumulative_pass_nr_for(ViewportId::ROOT);
+            core::mem::take(&mut *self.posted.lock().expect("posted lock"))
+                .into_iter()
+                .filter_map(|event| match event {
+                    UserEvent::RequestRepaint {
+                        viewport_id,
+                        when,
+                        cumulative_pass_nr,
+                    } => (viewport_id == ViewportId::ROOT
+                        && repaint_request_is_current(current, cumulative_pass_nr))
+                    .then(|| when.saturating_duration_since(since)),
+                    #[cfg(feature = "accesskit")]
+                    UserEvent::AccessKitActionRequest(_) => None,
+                })
+                .collect()
+        }
+
+        fn needs_full_ui(&self) -> bool {
+            retained_paint_needs_full_ui(&self.ctx, Some(&self.watch))
+        }
+    }
+
+    fn pointer_moved() -> RawInput {
+        RawInput {
+            events: vec![Event::PointerMoved(pos2(10.0, 10.0))],
+            ..Default::default()
+        }
+    }
+
+    fn scrolled() -> RawInput {
+        RawInput {
+            events: vec![Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(0.0, -40.0),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// egui brings a delayed repaint forward by its predicted frame time.
+    fn predicted_frame() -> Duration {
+        Duration::from_secs_f32(RawInput::default().predicted_dt)
+    }
+
+    fn is_immediate(delay: &Duration) -> bool {
+        *delay < Duration::from_millis(100)
+    }
+
+    fn is_about(delay: &Duration, expected: Duration) -> bool {
+        let early = expected
+            .saturating_sub(predicted_frame())
+            .saturating_sub(Duration::from_millis(1));
+        early <= *delay && *delay < expected + Duration::from_millis(100)
+    }
+
+    #[test]
+    fn an_input_pass_the_app_ignores_wakes_nothing() {
+        let root = Root::new();
+        assert_eq!(root.pass(pointer_moved(), |_| {}), []);
+        assert_eq!(root.pass(pointer_moved(), |_| {}), []);
+    }
+
+    #[test]
+    fn a_delayed_request_wakes_once_after_its_delay() {
+        let root = Root::new();
+        let posted = root.pass(pointer_moved(), |ui| {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        });
+        assert!(
+            matches!(posted.as_slice(), [delay] if is_about(delay, Duration::from_secs(1))),
+            "{posted:?}"
+        );
+        // The pass it wakes asks for nothing more.
+        assert_eq!(root.pass(RawInput::default(), |_| {}), []);
+    }
+
+    #[test]
+    fn an_immediate_request_wakes_one_pass() {
+        let root = Root::new();
+        let posted = root.pass(pointer_moved(), |ui| ui.ctx().request_repaint());
+        assert!(
+            matches!(posted.as_slice(), [delay] if is_immediate(delay)),
+            "{posted:?}"
+        );
+        // egui's second pass for an immediate request is not run.
+        assert_eq!(root.pass(RawInput::default(), |_| {}), []);
+    }
+
+    #[test]
+    fn scrolling_keeps_eguis_follow_up() {
+        let root = Root::new();
+        let posted = root.pass(scrolled(), |_| {});
+        assert!(
+            matches!(posted.as_slice(), [delay] if is_immediate(delay)),
+            "{posted:?}"
+        );
+    }
+
+    #[test]
+    fn another_thread_wakes_a_pass_while_one_runs() {
+        struct WakeFromAnotherThread;
+        impl egui::plugin::Plugin for WakeFromAnotherThread {
+            fn debug_name(&self) -> &'static str {
+                "wake from another thread"
+            }
+
+            fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || ctx.request_repaint_of(ViewportId::ROOT))
+                    .join()
+                    .expect("the other thread asks for a repaint");
+            }
+        }
+
+        let root = Root::new();
+        // While the app runs.
+        let posted = root.pass(pointer_moved(), |ui| {
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || ctx.request_repaint_of(ViewportId::ROOT))
+                .join()
+                .expect("the other thread asks for a repaint");
+        });
+        assert!(
+            matches!(posted.as_slice(), [delay] if is_immediate(delay)),
+            "{posted:?}"
+        );
+        // Before the app runs, when egui's own requests are not recorded.
+        root.ctx.add_plugin(WakeFromAnotherThread);
+        let posted = root.pass(pointer_moved(), |_| {});
+        assert!(
+            matches!(posted.as_slice(), [delay] if is_immediate(delay)),
+            "{posted:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_between_passes_wakes_a_pass() {
+        let root = Root::new();
+        // egui's own delay is left at zero by this pass.
+        assert_eq!(root.pass(pointer_moved(), |_| {}), []);
+
+        let since = Instant::now();
+        let ctx = root.ctx.clone();
+        std::thread::spawn(move || {
+            ctx.request_repaint_after_for(Duration::from_millis(500), ViewportId::ROOT);
+        })
+        .join()
+        .expect("the other thread asks for a repaint");
+        let posted = root.take(since);
+        assert!(
+            matches!(posted.as_slice(), [delay] if is_about(delay, Duration::from_millis(500))),
+            "{posted:?}"
+        );
+
+        let since = Instant::now();
+        root.ctx.request_repaint();
+        let posted = root.take(since);
+        assert!(
+            matches!(posted.as_slice(), [delay] if is_immediate(delay)),
+            "{posted:?}"
+        );
+    }
+
+    #[test]
+    fn paint_only_frames_replay_after_input_passes() {
+        let root = Root::new();
+        root.pass(pointer_moved(), |_| {});
+        root.pass(pointer_moved(), |_| {});
+        assert!(!root.needs_full_ui());
+
+        root.pass(pointer_moved(), |ui| {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        });
+        assert!(!root.needs_full_ui());
+
+        root.pass(pointer_moved(), |ui| ui.ctx().request_repaint());
+        assert!(root.needs_full_ui());
+    }
 }

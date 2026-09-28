@@ -28,6 +28,24 @@ pub(crate) trait WebPainter {
         capture: Vec<UserData>,
     ) -> Result<(), JsValue>;
 
+    /// Ueye patch: paints the same primitives as the last full frame again,
+    /// without uploading their meshes where the renderer keeps them (glow),
+    /// running only paint callbacks. The default repaints them normally.
+    fn paint_retained(
+        &mut self,
+        clear_color: [f32; 4],
+        clipped_primitives: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+    ) -> Result<(), JsValue> {
+        self.paint_and_update_textures(
+            clear_color,
+            clipped_primitives,
+            pixels_per_point,
+            &mut egui::TexturesDelta::default(),
+            Vec::new(),
+        )
+    }
+
     fn handle_screenshots(&mut self, events: &mut Vec<Event>);
 
     /// Destroy all resources.

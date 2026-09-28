@@ -25,6 +25,11 @@ pub struct AppRunner {
     // Output for the last run:
     textures_delta: TexturesDelta,
     clipped_primitives: Option<Vec<egui::ClippedPrimitive>>,
+
+    /// Ueye patch: the last full frame's paint jobs, replayed by paint-only
+    /// frames, and the time (`now_sec`) the next one is due.
+    retained: Option<Vec<egui::ClippedPrimitive>>,
+    paint_only_at: Option<f64>,
 }
 
 impl Drop for AppRunner {
@@ -145,6 +150,9 @@ impl AppRunner {
             let needs_repaint = Arc::clone(&needs_repaint);
             egui_ctx.set_request_repaint_callback(move |info| {
                 needs_repaint.repaint_after(info.delay.as_secs_f64());
+                // Ueye patch: the runner only asks for animation frames while
+                // one is due, so a repaint request wakes it.
+                super::wake();
             });
         }
 
@@ -161,6 +169,8 @@ impl AppRunner {
             screenshot_commands_with_frame_delay: vec![],
             textures_delta: Default::default(),
             clipped_primitives: None,
+            retained: None,
+            paint_only_at: None,
         };
 
         runner.input.raw.max_texture_side = Some(runner.painter.max_texture_side());
@@ -345,6 +355,8 @@ impl AppRunner {
     /// Paint the results of the last call to [`Self::logic`].
     pub fn paint(&mut self) {
         let clipped_primitives = core::mem::take(&mut self.clipped_primitives);
+        self.retained = None;
+        self.paint_only_at = None;
 
         if let Some(clipped_primitives) = clipped_primitives {
             let mut screenshot_commands = vec![];
@@ -361,6 +373,7 @@ impl AppRunner {
             if !self.screenshot_commands_with_frame_delay.is_empty() {
                 self.egui_ctx().request_repaint();
             }
+            let can_retain = screenshot_commands.is_empty() && self.textures_delta.free.is_empty();
 
             if let Err(err) = self.painter.paint_and_update_textures(
                 self.app.clear_color(&self.egui_ctx.global_style().visuals),
@@ -370,6 +383,68 @@ impl AppRunner {
                 screenshot_commands,
             ) {
                 log::error!("Failed to paint: {}", super::string_from_js_value(&err));
+            }
+
+            // Ueye patch: keep the jobs when paint-only frames follow.
+            if can_retain
+                && let Some(repaint_after) = self.web_options.retained_repaint_after.and_then(
+                    |cadence| cadence(&self.egui_ctx, None, false, web_time::Instant::now()),
+                )
+            {
+                self.retained = Some(clipped_primitives);
+                self.paint_only_at = Some(super::now_sec() + repaint_after.as_secs_f64());
+            }
+        }
+    }
+
+    /// Ueye patch (DESIGN.md 9.4): whether a pointer move to `pointer` (in
+    /// points, `None` when it left the canvas) needs no UI pass.
+    pub fn pointer_move_filtered(&self, pointer: Option<egui::Pos2>) -> bool {
+        self.web_options
+            .pointer_move_needs_ui_pass
+            .is_some_and(|needs_ui_pass| !needs_ui_pass(&self.egui_ctx, pointer))
+    }
+
+    /// Ueye patch: whether a paint-only frame is due now.
+    pub fn paint_only_due(&self) -> bool {
+        self.paint_only_at
+            .is_some_and(|at| at <= super::now_sec())
+    }
+
+    /// Ueye patch: when the next frame of any kind is due (`now_sec` scale),
+    /// or infinity at rest.
+    pub fn next_frame_time(&self) -> f64 {
+        self.needs_repaint
+            .when_to_repaint()
+            .min(self.paint_only_at.unwrap_or(f64::INFINITY))
+    }
+
+    /// Ueye patch: replays the last full frame, running only its paint
+    /// callbacks, and asks the cadence for the next one.
+    pub fn paint_only(&mut self) {
+        let Some(primitives) = self.retained.as_ref() else {
+            self.paint_only_at = None;
+            return;
+        };
+        let started = web_time::Instant::now();
+        if let Err(err) = self.painter.paint_retained(
+            self.app.clear_color(&self.egui_ctx.global_style().visuals),
+            primitives,
+            self.egui_ctx.pixels_per_point(),
+        ) {
+            log::error!("Failed to paint: {}", super::string_from_js_value(&err));
+        }
+        let next = self
+            .web_options
+            .retained_repaint_after
+            .and_then(|cadence| cadence(&self.egui_ctx, None, true, started));
+        match next {
+            Some(repaint_after) => {
+                self.paint_only_at = Some(super::now_sec() + repaint_after.as_secs_f64());
+            }
+            None => {
+                self.retained = None;
+                self.paint_only_at = None;
             }
         }
     }

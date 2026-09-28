@@ -36,7 +36,7 @@ use log::warn;
 
 use super::{
     epi_integration, event_loop_context,
-    winit_integration::{EventResult, UserEvent, WinitApp, create_egui_context},
+    winit_integration::{self, EventResult, UserEvent, WinitApp, create_egui_context},
 };
 use crate::epaint::textures::TexturesDelta;
 use crate::{
@@ -78,6 +78,26 @@ struct GlowWinitRunning<'app> {
 
     /// Any not yet applied deltas for this app.
     pending_deltas: TexturesDelta,
+
+    /// Ueye patch: the cadence of retained paint-only frames
+    /// (`NativeOptions::retained_repaint_after`).
+    retained_repaint_after: Option<
+        fn(&egui::Context, Option<u32>, bool, std::time::Instant) -> Option<core::time::Duration>,
+    >,
+
+    /// Ueye patch: the root viewport's last paint jobs, replayed by
+    /// paint-only frames until a UI pass changes them.
+    retained_root: Option<RetainedFrame>,
+}
+
+/// Ueye patch: root viewport paint jobs whose meshes `egui_glow` keeps
+/// uploaded, so a paint-only frame only runs paint callbacks.
+struct RetainedFrame {
+    primitives: Vec<egui::ClippedPrimitive>,
+    pixels_per_point: f32,
+    clear_color: [f32; 4],
+    size_px: [u32; 2],
+    repaint_after: core::time::Duration,
 }
 
 impl Drop for GlowWinitRunning<'_> {
@@ -281,7 +301,7 @@ impl<'app> GlowWinitApp<'app> {
 
         let painter = Rc::new(RefCell::new(painter));
 
-        let integration = EpiIntegration::new(
+        let mut integration = EpiIntegration::new(
             egui_ctx,
             &glutin.window(ViewportId::ROOT),
             &self.app_name,
@@ -298,21 +318,10 @@ impl<'app> GlowWinitApp<'app> {
 
         {
             let event_loop_proxy = Arc::clone(&self.repaint_proxy);
-            integration
-                .egui_ctx
-                .set_request_repaint_callback(move |info| {
-                    log::trace!("request_repaint_callback: {info:?}");
-                    let when = Instant::now() + info.delay;
-                    let cumulative_pass_nr = info.current_cumulative_pass_nr;
-                    event_loop_proxy
-                        .lock()
-                        .send_event(UserEvent::RequestRepaint {
-                            viewport_id: info.viewport_id,
-                            when,
-                            cumulative_pass_nr,
-                        })
-                        .ok();
-                });
+            // Ueye patch: shared with wgpu, see `RepaintWatch`.
+            integration.install_repaint_callbacks(move |event| {
+                event_loop_proxy.lock().send_event(event).ok();
+            });
         }
 
         #[cfg(feature = "accesskit")]
@@ -397,6 +406,8 @@ impl<'app> GlowWinitApp<'app> {
             glutin,
             painter,
             pending_deltas: Default::default(),
+            retained_repaint_after: self.native_options.retained_repaint_after,
+            retained_root: None,
         }))
     }
 }
@@ -466,6 +477,18 @@ impl WinitApp for GlowWinitApp<'_> {
         }
     }
 
+    fn run_paint_only(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) -> Result<EventResult> {
+        if let Some(running) = &mut self.running {
+            running.run_paint_only(event_loop, window_id)
+        } else {
+            Ok(EventResult::Wait)
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) -> crate::Result<EventResult> {
         log::debug!("Event::Resumed");
 
@@ -519,12 +542,54 @@ impl WinitApp for GlowWinitApp<'_> {
                 if let Some(egui_winit) = viewport.egui_winit.as_mut()
                     && egui_winit.on_mouse_motion(delta)
                 {
+                    // Ueye patch (DESIGN.md 9.4): with pointer filtering, raw
+                    // motion runs no pass by itself unless a button is held;
+                    // the window's own pointer moves decide.
+                    if self.native_options.pointer_move_needs_ui_pass.is_some()
+                        && !egui_winit.is_any_pointer_button_down()
+                    {
+                        crate::pointer_filter::merge_mouse_motion(egui_winit.egui_input_mut());
+                        return Ok(EventResult::Wait);
+                    }
                     return Ok(EventResult::RepaintNext(window.id()));
                 }
             }
         }
 
         Ok(EventResult::Wait)
+    }
+
+    fn pointer_move_filtered(
+        &mut self,
+        window_id: WindowId,
+        event: &winit::event::WindowEvent,
+    ) -> bool {
+        let (Some(needs_ui_pass), Some(running)) = (
+            self.native_options.pointer_move_needs_ui_pass,
+            &mut self.running,
+        ) else {
+            return false;
+        };
+        let egui_ctx = &running.integration.egui_ctx;
+        let mut glutin = running.glutin.borrow_mut();
+        if glutin.viewport_from_window.get(&window_id) != Some(&ViewportId::ROOT) {
+            return false;
+        }
+        let Some(viewport) = glutin.viewports.get_mut(&ViewportId::ROOT) else {
+            return false;
+        };
+        let (Some(window), Some(egui_winit)) = (&viewport.window, &mut viewport.egui_winit) else {
+            return false;
+        };
+        let pixels_per_point = egui_winit::pixels_per_point(egui_ctx, window);
+        let Some(pointer) = winit_integration::pointer_move(event, pixels_per_point) else {
+            return false;
+        };
+        if needs_ui_pass(egui_ctx, pointer) {
+            return false;
+        }
+        crate::pointer_filter::drop_superseded_pointer_move(egui_winit.egui_input_mut());
+        true
     }
 
     fn window_event(
@@ -584,6 +649,7 @@ impl GlowWinitRunning<'_> {
 
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
+        let frame_started = std::time::Instant::now();
 
         {
             let glutin = self.glutin.borrow();
@@ -744,8 +810,11 @@ impl GlowWinitRunning<'_> {
             glutin,
             painter,
             pending_deltas,
+            retained_repaint_after,
+            retained_root,
             ..
         } = self;
+        *retained_root = None;
 
         let mut glutin = glutin.borrow_mut();
         let mut painter = painter.borrow_mut();
@@ -795,12 +864,42 @@ impl GlowWinitRunning<'_> {
                 painter.clear(screen_size_in_pixels, clear_color);
             }
 
+            // Ueye patch: the root frame can be replayed when nothing but paint
+            // callbacks changes (no freed textures, no screenshot).
+            let can_retain = viewport_id == ViewportId::ROOT
+                && screen_size_in_pixels[0] > 0
+                && screen_size_in_pixels[1] > 0
+                && pending_deltas.free.is_empty()
+                && viewport
+                    .actions_requested
+                    .iter()
+                    .all(|action| !matches!(action, ActionRequested::Screenshot(_)));
             painter.paint_and_update_textures(
                 screen_size_in_pixels,
                 pixels_per_point,
                 &clipped_primitives,
                 pending_deltas,
             );
+            if can_retain {
+                *retained_root = retained_repaint_after
+                    .and_then(|cadence| {
+                        cadence(
+                            &integration.egui_ctx,
+                            window
+                                .current_monitor()
+                                .and_then(|monitor| monitor.refresh_rate_millihertz()),
+                            false,
+                            frame_started,
+                        )
+                    })
+                    .map(|repaint_after| RetainedFrame {
+                        primitives: clipped_primitives,
+                        pixels_per_point,
+                        clear_color,
+                        size_px: screen_size_in_pixels,
+                        repaint_after,
+                    });
+            }
 
             {
                 for action in viewport.actions_requested.drain(..) {
@@ -870,9 +969,128 @@ impl GlowWinitRunning<'_> {
 
         sleep_if_invisible_or_minimized(Some(&window));
 
+        if glutin.viewports.len() > 1 {
+            *retained_root = None;
+        }
+
         if integration.should_close() {
             Ok(EventResult::CloseRequested)
+        } else if let Some(frame) = retained_root.as_ref() {
+            Ok(EventResult::PaintOnlyAt(
+                window_id,
+                frame_started + frame.repaint_after,
+            ))
+        } else if viewport_id == ViewportId::ROOT
+            && let Some(cadence) = retained_repaint_after.and_then(|cadence| {
+                cadence(
+                    &integration.egui_ctx,
+                    window
+                        .current_monitor()
+                        .and_then(|monitor| monitor.refresh_rate_millihertz()),
+                    false,
+                    frame_started,
+                )
+            })
+        {
+            // Retention was blocked (a screenshot, freed textures, several
+            // viewports): keep the animation alive with regular frames.
+            Ok(EventResult::RepaintAt(window_id, frame_started + cadence))
         } else {
+            Ok(EventResult::Wait)
+        }
+    }
+
+    /// Ueye patch: replays the retained root frame with only its paint
+    /// callbacks prepared again, or runs a full UI pass when anything else
+    /// changed.
+    fn run_paint_only(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) -> Result<EventResult> {
+        let can_replay = {
+            let glutin = self.glutin.borrow();
+            let painter = self.painter.borrow();
+            glutin.viewport_from_window.get(&window_id) == Some(&ViewportId::ROOT)
+                && glutin.viewports.len() == 1
+                && glutin.viewports.get(&ViewportId::ROOT).is_some_and(|viewport| {
+                    viewport.window.as_ref().is_some_and(|window| {
+                        let size: [u32; 2] = window.inner_size().into();
+                        self.retained_root.as_ref().is_some_and(|frame| {
+                            frame.size_px == size
+                                && frame.pixels_per_point
+                                    == self.integration.egui_ctx.pixels_per_point()
+                                && painter.can_replay(frame.primitives.len())
+                        })
+                    }) && viewport.gl_surface.is_some()
+                        && viewport.info.visible().unwrap_or(true)
+                        && viewport.info.events.is_empty()
+                        && viewport.actions_requested.is_empty()
+                        && viewport.egui_winit.as_ref().is_some_and(|state| {
+                            let input = state.egui_input();
+                            crate::pointer_filter::only_pointer_moves(&input.events)
+                                && input.hovered_files.is_empty()
+                                && input.dropped_files.is_empty()
+                        })
+                })
+                && self.pending_deltas.set.is_empty()
+                && self.pending_deltas.free.is_empty()
+                && !self.integration.retained_paint_needs_full_ui()
+        };
+        if !can_replay {
+            self.retained_root = None;
+            return self.run_ui_and_paint(event_loop, window_id);
+        }
+        profiling::scope!("retained_paint_only");
+        let frame_started = std::time::Instant::now();
+        let mut glutin = self.glutin.borrow_mut();
+        let GlutinWindowContext {
+            viewports,
+            current_gl_context,
+            not_current_gl_context,
+            ..
+        } = &mut *glutin;
+        let Some(viewport) = viewports.get(&ViewportId::ROOT) else {
+            return Ok(EventResult::Wait);
+        };
+        let (Some(window), Some(gl_surface)) =
+            (viewport.window.clone(), viewport.gl_surface.as_ref())
+        else {
+            return Ok(EventResult::Wait);
+        };
+        let frame = self.retained_root.as_ref().expect("checked above");
+        change_gl_context(current_gl_context, not_current_gl_context, gl_surface);
+        {
+            let mut painter = self.painter.borrow_mut();
+            painter.clear(frame.size_px, frame.clear_color);
+            painter.paint_primitives_retained(
+                frame.size_px,
+                frame.pixels_per_point,
+                &frame.primitives,
+            );
+        }
+        let context = current_gl_context.as_ref().ok_or_else(|| {
+            egui_glow::PainterError::from(
+                "failed to get current context to swap buffers".to_owned(),
+            )
+        })?;
+        gl_surface.swap_buffers(context)?;
+        self.integration.post_rendering(&window);
+        let repaint_after = self.retained_repaint_after.and_then(|cadence| {
+            cadence(
+                &self.integration.egui_ctx,
+                window
+                    .current_monitor()
+                    .and_then(|monitor| monitor.refresh_rate_millihertz()),
+                true,
+                frame_started,
+            )
+        });
+        drop(glutin);
+        if let Some(repaint_after) = repaint_after {
+            Ok(EventResult::PaintOnlyAt(window_id, frame_started + repaint_after))
+        } else {
+            self.retained_root = None;
             Ok(EventResult::Wait)
         }
     }
@@ -884,6 +1102,20 @@ impl GlowWinitRunning<'_> {
     ) -> EventResult {
         let mut glutin = self.glutin.borrow_mut();
         let viewport_id = glutin.viewport_from_window.get(&window_id).copied();
+
+        if viewport_id == Some(egui::ViewportId::ROOT)
+            && let winit::event::WindowEvent::PinchGesture { delta, phase, .. } = event
+        {
+            self.app.on_native_pinch(
+                *delta,
+                match phase {
+                    winit::event::TouchPhase::Started => egui::TouchPhase::Start,
+                    winit::event::TouchPhase::Moved => egui::TouchPhase::Move,
+                    winit::event::TouchPhase::Ended => egui::TouchPhase::End,
+                    winit::event::TouchPhase::Cancelled => egui::TouchPhase::Cancel,
+                },
+            );
+        }
 
         // On Windows, if a window is resized by the user, it should repaint synchronously, inside the
         // event handler.
