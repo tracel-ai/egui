@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use egui::{
     emath::Rect,
-    epaint::{Mesh, PaintCallbackInfo, Primitive, Vertex},
+    epaint::{PaintCallbackInfo, Primitive, Vertex},
 };
 use glow::HasContext as _;
 
@@ -100,6 +100,11 @@ pub struct Painter {
 
     /// Stores outdated OpenGL textures that are yet to be deleted
     textures_to_destroy: Vec<glow::Texture>,
+
+    /// Ueye patch: where each mesh of the last full frame sits in `vbo` and
+    /// `element_array_buffer` (byte offset of its indices, index count), so a
+    /// paint-only frame can draw them again without uploading.
+    retained: Vec<Option<(i32, i32)>>,
 
     /// Used to make sure we are destroyed correctly.
     destroyed: bool,
@@ -267,6 +272,7 @@ impl Painter {
                 textures: Default::default(),
                 next_native_tex_id: 1 << 32,
                 textures_to_destroy: Vec::new(),
+                retained: Vec::new(),
                 destroyed: false,
             })
         }
@@ -406,18 +412,105 @@ impl Painter {
         profiling::function_scope!();
         self.assert_not_destroyed();
 
-        unsafe { self.prepare_painting(screen_size_px, pixels_per_point) };
+        // Ueye patch: upload every mesh of the frame once, into one vertex and
+        // one index buffer, so `paint_primitives_retained` can replay them.
+        self.upload_meshes(clipped_primitives);
+        self.draw_primitives(screen_size_px, pixels_per_point, clipped_primitives);
+    }
 
-        for egui::ClippedPrimitive {
+    /// Ueye patch: paints the same primitives as the last
+    /// [`Self::paint_primitives`] without uploading their meshes again: only
+    /// paint callbacks run, so they can update their animation inputs. Falls
+    /// back to a full paint when the primitives don't match.
+    pub fn paint_primitives_retained(
+        &mut self,
+        screen_size_px: [u32; 2],
+        pixels_per_point: f32,
+        clipped_primitives: &[egui::ClippedPrimitive],
+    ) {
+        profiling::function_scope!();
+        self.assert_not_destroyed();
+        if self.retained.len() != clipped_primitives.len() {
+            self.paint_primitives(screen_size_px, pixels_per_point, clipped_primitives);
+            return;
+        }
+        self.draw_primitives(screen_size_px, pixels_per_point, clipped_primitives);
+    }
+
+    /// Whether [`Self::paint_primitives_retained`] can replay `count`
+    /// primitives from the last full frame.
+    pub fn can_replay(&self, count: usize) -> bool {
+        !self.retained.is_empty() && self.retained.len() == count
+    }
+
+    fn upload_meshes(&mut self, clipped_primitives: &[egui::ClippedPrimitive]) {
+        let mut vertices: Vec<egui::epaint::Vertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        self.retained.clear();
+        for egui::ClippedPrimitive { primitive, .. } in clipped_primitives {
+            match primitive {
+                Primitive::Mesh(mesh) if self.texture(mesh.texture_id).is_some() => {
+                    debug_assert!(mesh.is_valid(), "Mesh is not valid");
+                    let base = vertices.len() as u32;
+                    let offset = (indices.len() * core::mem::size_of::<u32>()) as i32;
+                    vertices.extend_from_slice(&mesh.vertices);
+                    indices.extend(mesh.indices.iter().map(|index| index + base));
+                    self.retained.push(Some((offset, mesh.indices.len() as i32)));
+                }
+                Primitive::Mesh(mesh) => {
+                    log::warn!("Failed to find texture {:?}", mesh.texture_id);
+                    self.retained.push(None);
+                }
+                Primitive::Callback(_) => self.retained.push(None),
+            }
+        }
+        unsafe {
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+            self.gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&vertices),
+                glow::STREAM_DRAW,
+            );
+            self.gl
+                .bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.element_array_buffer));
+            self.gl.buffer_data_u8_slice(
+                glow::ELEMENT_ARRAY_BUFFER,
+                bytemuck::cast_slice(&indices),
+                glow::STREAM_DRAW,
+            );
+        }
+        check_for_gl_error!(&self.gl, "upload_meshes");
+    }
+
+    fn draw_primitives(
+        &mut self,
+        screen_size_px: [u32; 2],
+        pixels_per_point: f32,
+        clipped_primitives: &[egui::ClippedPrimitive],
+    ) {
+        unsafe {
+            self.prepare_painting(screen_size_px, pixels_per_point);
+        };
+
+        for (index, egui::ClippedPrimitive {
             clip_rect,
             primitive,
-        } in clipped_primitives
+        }) in clipped_primitives.iter().enumerate()
         {
             set_clip_rect(&self.gl, screen_size_px, pixels_per_point, *clip_rect);
 
             match primitive {
                 Primitive::Mesh(mesh) => {
-                    self.paint_mesh(mesh);
+                    if let (Some(Some((offset, count))), Some(texture)) =
+                        (self.retained.get(index).copied(), self.texture(mesh.texture_id))
+                    {
+                        unsafe {
+                            self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                            self.gl
+                                .draw_elements(glow::TRIANGLES, count, glow::UNSIGNED_INT, offset);
+                        }
+                        check_for_gl_error!(&self.gl, "paint_mesh");
+                    }
                 }
                 Primitive::Callback(callback) => {
                     if callback.rect.is_positive() {
@@ -451,7 +544,9 @@ impl Painter {
                         check_for_gl_error!(&self.gl, "callback");
 
                         // Restore state:
-                        unsafe { self.prepare_painting(screen_size_px, pixels_per_point) };
+                        unsafe {
+                            self.prepare_painting(screen_size_px, pixels_per_point);
+                        };
                     }
                 }
             }
@@ -464,44 +559,6 @@ impl Painter {
             self.gl.disable(glow::SCISSOR_TEST);
 
             check_for_gl_error!(&self.gl, "painting");
-        }
-    }
-
-    #[inline(never)] // Easier profiling
-    fn paint_mesh(&mut self, mesh: &Mesh) {
-        debug_assert!(mesh.is_valid(), "Mesh is not valid");
-        if let Some(texture) = self.texture(mesh.texture_id) {
-            unsafe {
-                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
-                self.gl.buffer_data_u8_slice(
-                    glow::ARRAY_BUFFER,
-                    bytemuck::cast_slice(&mesh.vertices),
-                    glow::STREAM_DRAW,
-                );
-
-                self.gl
-                    .bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.element_array_buffer));
-                self.gl.buffer_data_u8_slice(
-                    glow::ELEMENT_ARRAY_BUFFER,
-                    bytemuck::cast_slice(&mesh.indices),
-                    glow::STREAM_DRAW,
-                );
-
-                self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            }
-
-            unsafe {
-                self.gl.draw_elements(
-                    glow::TRIANGLES,
-                    mesh.indices.len() as i32,
-                    glow::UNSIGNED_INT,
-                    0,
-                );
-            }
-
-            check_for_gl_error!(&self.gl, "paint_mesh");
-        } else {
-            log::warn!("Failed to find texture {:?}", mesh.texture_id);
         }
     }
 

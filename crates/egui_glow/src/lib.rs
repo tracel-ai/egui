@@ -11,6 +11,7 @@
 #![expect(clippy::undocumented_unsafe_blocks)]
 
 pub mod painter;
+pub mod custom;
 pub use glow;
 pub use painter::{CallbackFn, Painter, PainterError};
 mod misc_util;
