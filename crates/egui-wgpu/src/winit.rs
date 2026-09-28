@@ -93,6 +93,30 @@ impl Painter {
         self.render_state.clone()
     }
 
+    /// Whether a viewport can reuse mesh buffers uploaded by its last paint.
+    /// A host still needs to invalidate for input, paint-job, and texture
+    /// changes that only it can observe.
+    pub fn can_replay_cached_meshes(
+        &self,
+        viewport_id: ViewportId,
+        expected_size: [u32; 2],
+        expected_config: SurfaceConfig,
+    ) -> bool {
+        self.render_state
+            .as_ref()
+            .is_some_and(|state| state.surface_config == expected_config)
+            && self.surfaces.get(&viewport_id).is_some_and(|surface| {
+                [surface.width, surface.height] == expected_size
+                    && !surface.needs_reconfigure
+                    && !surface.needs_recreate
+            })
+    }
+
+    /// Configuration associated with the currently initialized surface.
+    pub fn surface_config(&self) -> Option<SurfaceConfig> {
+        self.render_state.as_ref().map(|state| state.surface_config)
+    }
+
     fn configure_surface(
         surface_state: &SurfaceState,
         render_state: &RenderState,
@@ -483,6 +507,58 @@ impl Painter {
         capture_data: Vec<UserData>,
         window: &Arc<winit::window::Window>,
     ) -> f32 {
+        self.paint_impl(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            clipped_primitives,
+            textures_delta,
+            capture_data,
+            window,
+            false,
+        )
+    }
+
+    /// Repaint the last mesh set while preparing paint callbacks again.
+    ///
+    /// The caller must supply the same paint jobs and screen configuration as
+    /// the most recent regular paint. This avoids tessellation and all mesh
+    /// vertex/index uploads for a shader-only animation frame.
+    #[expect(clippy::too_many_arguments)]
+    pub fn paint_with_cached_meshes(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        clipped_primitives: &[epaint::ClippedPrimitive],
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<UserData>,
+        window: &Arc<winit::window::Window>,
+    ) -> f32 {
+        self.paint_impl(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            clipped_primitives,
+            textures_delta,
+            capture_data,
+            window,
+            true,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn paint_impl(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        clipped_primitives: &[epaint::ClippedPrimitive],
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<UserData>,
+        window: &Arc<winit::window::Window>,
+        cached_meshes: bool,
+    ) -> f32 {
         profiling::function_scope!();
 
         /// Guard to ensure that commands are always submitted to the renderer queue
@@ -577,13 +653,23 @@ impl Painter {
                 }
             }
 
-            renderer.update_buffers(
-                &render_state.device,
-                &render_state.queue,
-                &mut encoder,
-                clipped_primitives,
-                &screen_descriptor,
-            )
+            if cached_meshes {
+                renderer.update_callbacks_only(
+                    &render_state.device,
+                    &render_state.queue,
+                    &mut encoder,
+                    clipped_primitives,
+                    &screen_descriptor,
+                )
+            } else {
+                renderer.update_buffers(
+                    &render_state.device,
+                    &render_state.queue,
+                    &mut encoder,
+                    clipped_primitives,
+                    &screen_descriptor,
+                )
+            }
         };
 
         if surface_state.needs_reconfigure {
@@ -626,6 +712,19 @@ impl Painter {
                 return vsync_sec;
             }
         };
+
+        // The prefix pass lives in this encoder. Do not mark it cached until a
+        // surface image has been acquired, since an acquisition failure drops
+        // the encoder without submitting its commands.
+        if cached_meshes {
+            render_state.renderer.write().prepare_cached_prefix(
+                &render_state.device,
+                &mut encoder,
+                clipped_primitives,
+                &screen_descriptor,
+                clear_color,
+            );
+        }
 
         let mut capture_buffer = None;
         {
@@ -701,11 +800,16 @@ impl Painter {
             // Forgetting the pass' lifetime means that we are no longer compile-time protected from
             // runtime errors caused by accessing the parent encoder before the render pass is dropped.
             // Since we don't pass it on to the renderer, we should be perfectly safe against this mistake here!
-            renderer.render(
-                &mut render_pass.forget_lifetime(),
-                clipped_primitives,
-                &screen_descriptor,
-            );
+            let mut render_pass = render_pass.forget_lifetime();
+            if cached_meshes {
+                renderer.render_with_cached_prefix(
+                    &mut render_pass,
+                    clipped_primitives,
+                    &screen_descriptor,
+                );
+            } else {
+                renderer.render(&mut render_pass, clipped_primitives, &screen_descriptor);
+            }
 
             if capture && let Some(capture_state) = &mut self.screen_capture_state {
                 capture_buffer = Some(capture_state.copy_textures(

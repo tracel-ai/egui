@@ -97,6 +97,27 @@ pub trait CallbackTrait: Send + Sync {
         Vec::new()
     }
 
+    /// Prepare a replay of the same paint jobs and screen descriptor as the
+    /// preceding full frame. Callbacks with persistent GPU resources may only
+    /// update their animation inputs here. The default preserves the behavior
+    /// of existing callbacks.
+    fn prepare_retained(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen_descriptor: &ScreenDescriptor,
+        egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        self.prepare(
+            device,
+            queue,
+            screen_descriptor,
+            egui_encoder,
+            callback_resources,
+        )
+    }
+
     /// Called after all [`CallbackTrait::prepare`] calls are done.
     fn finish_prepare(
         &self,
@@ -106,6 +127,18 @@ pub trait CallbackTrait: Send + Sync {
         _callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         Vec::new()
+    }
+
+    /// Complete a retained replay. By default, use the regular completion path
+    /// so callbacks outside this renderer need no changes.
+    fn finish_prepare_retained(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        self.finish_prepare(device, queue, egui_encoder, callback_resources)
     }
 
     /// Called after all [`CallbackTrait::finish_prepare`] calls are done.
@@ -156,6 +189,22 @@ struct SlicedBuffer {
     buffer: wgpu::Buffer,
     slices: Vec<Range<usize>>,
     capacity: wgpu::BufferAddress,
+}
+
+struct CachedPrefixPipeline {
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+}
+
+struct CachedPrefix {
+    // Keep the texture alive while its view is bound by the composite draw.
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    primitive_count: usize,
+    mesh_count: usize,
+    size_in_pixels: [u32; 2],
+    pixels_per_point: f32,
+    clear_color: [f32; 4],
 }
 
 pub struct Texture {
@@ -236,6 +285,10 @@ impl Default for RendererOptions {
 /// Renderer for a egui based GUI.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
+
+    output_color_format: wgpu::TextureFormat,
+    cached_prefix_pipeline: Option<CachedPrefixPipeline>,
+    cached_prefix: Option<CachedPrefix>,
 
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
@@ -443,6 +496,9 @@ impl Renderer {
 
         Self {
             pipeline,
+            output_color_format,
+            cached_prefix_pipeline: None,
+            cached_prefix: None,
             vertex_buffer: SlicedBuffer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
@@ -482,6 +538,27 @@ impl Renderer {
         paint_jobs: &[epaint::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
     ) {
+        self.render_impl(render_pass, paint_jobs, screen_descriptor, false);
+    }
+
+    /// Replay a retained frame with its previously rendered static prefix.
+    /// Falls back to regular rendering if the prefix is not cacheable.
+    pub(crate) fn render_with_cached_prefix(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+    ) {
+        self.render_impl(render_pass, paint_jobs, screen_descriptor, true);
+    }
+
+    fn render_impl(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+        use_cached_prefix: bool,
+    ) {
         profiling::function_scope!();
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
@@ -493,6 +570,42 @@ impl Renderer {
 
         let mut index_buffer_slices = self.index_buffer.slices.iter();
         let mut vertex_buffer_slices = self.vertex_buffer.slices.iter();
+
+        let paint_jobs = if use_cached_prefix {
+            if let (Some(cache), Some(blit)) = (
+                self.cached_prefix.as_ref(),
+                self.cached_prefix_pipeline.as_ref(),
+            ) {
+                if cache.size_in_pixels == size_in_pixels
+                    && cache.pixels_per_point == pixels_per_point
+                    && cache.primitive_count <= paint_jobs.len()
+                {
+                    render_pass.set_viewport(
+                        0.0,
+                        0.0,
+                        size_in_pixels[0] as f32,
+                        size_in_pixels[1] as f32,
+                        0.0,
+                        1.0,
+                    );
+                    render_pass.set_scissor_rect(0, 0, size_in_pixels[0], size_in_pixels[1]);
+                    render_pass.set_pipeline(&blit.pipeline);
+                    render_pass.set_bind_group(0, &cache.bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                    for _ in 0..cache.mesh_count {
+                        index_buffer_slices.next();
+                        vertex_buffer_slices.next();
+                    }
+                    &paint_jobs[cache.primitive_count..]
+                } else {
+                    paint_jobs
+                }
+            } else {
+                paint_jobs
+            }
+        } else {
+            paint_jobs
+        };
 
         for epaint::ClippedPrimitive {
             clip_rect,
@@ -510,6 +623,17 @@ impl Renderer {
                 );
                 render_pass.set_pipeline(&self.pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                // update_buffers packs every mesh into these two buffers. Keep
+                // them bound for the whole mesh run, then use draw offsets for
+                // each mesh. Callbacks may change the bindings, so rebind after
+                // each callback before drawing the next mesh.
+                if !self.index_buffer.slices.is_empty() {
+                    render_pass.set_index_buffer(
+                        self.index_buffer.buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.set_vertex_buffer(0, self.vertex_buffer.buffer.slice(..));
+                }
                 needs_reset = false;
             }
 
@@ -544,19 +668,15 @@ impl Renderer {
 
                     if let Some(Texture { bind_group, .. }) = self.textures.get(&mesh.texture_id) {
                         render_pass.set_bind_group(1, bind_group, &[]);
-                        render_pass.set_index_buffer(
-                            self.index_buffer.buffer.slice(
-                                index_buffer_slice.start as u64..index_buffer_slice.end as u64,
-                            ),
-                            wgpu::IndexFormat::Uint32,
+                        let first_index =
+                            (index_buffer_slice.start / core::mem::size_of::<u32>()) as u32;
+                        let base_vertex =
+                            (vertex_buffer_slice.start / core::mem::size_of::<Vertex>()) as i32;
+                        render_pass.draw_indexed(
+                            first_index..first_index + mesh.indices.len() as u32,
+                            base_vertex,
+                            0..1,
                         );
-                        render_pass.set_vertex_buffer(
-                            0,
-                            self.vertex_buffer.buffer.slice(
-                                vertex_buffer_slice.start as u64..vertex_buffer_slice.end as u64,
-                            ),
-                        );
-                        render_pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
                     } else {
                         log::warn!("Missing texture: {:?}", mesh.texture_id);
                     }
@@ -606,6 +726,185 @@ impl Renderer {
         render_pass.set_scissor_rect(0, 0, size_in_pixels[0], size_in_pixels[1]);
     }
 
+    /// Flatten the leading static meshes into the same pixel state they would
+    /// leave in the window before its first callback. This is used only for
+    /// retained paints, when no egui meshes or managed textures have changed.
+    pub fn prepare_cached_prefix(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+        clear_color: [f32; 4],
+    ) {
+        if self.cached_prefix.as_ref().is_some_and(|cache| {
+            cache.size_in_pixels == screen_descriptor.size_in_pixels
+                && cache.pixels_per_point == screen_descriptor.pixels_per_point
+                && cache.clear_color == clear_color
+        }) {
+            return;
+        }
+        self.cached_prefix = None;
+
+        // A resolved MSAA image cannot preserve the sample state seen by later
+        // callbacks. Native/user textures may change without an egui repaint.
+        if self.options.msaa_samples > 1
+            || self.options.depth_stencil_format.is_some()
+            || !matches!(
+                self.output_color_format,
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+            )
+        {
+            return;
+        }
+
+        const MIN_PREFIX_MESHES: usize = 12;
+        const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+        let primitive_count = paint_jobs
+            .iter()
+            .take_while(|job| matches!(job.primitive, Primitive::Mesh(_)))
+            .count();
+        if primitive_count < MIN_PREFIX_MESHES
+            || paint_jobs[..primitive_count].iter().any(|job| {
+                let Primitive::Mesh(mesh) = &job.primitive else {
+                    unreachable!("prefix contains only meshes")
+                };
+                !matches!(mesh.texture_id, epaint::TextureId::Managed(_))
+                    || !self.textures.contains_key(&mesh.texture_id)
+            })
+        {
+            return;
+        }
+
+        let [width, height] = screen_descriptor.size_in_pixels;
+        if width == 0 || height == 0 || u64::from(width) * u64::from(height) * 4 > MAX_CACHE_BYTES {
+            return;
+        }
+
+        if self.cached_prefix_pipeline.is_none() {
+            self.cached_prefix_pipeline = Some(self.create_cached_prefix_pipeline(device));
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("egui_retained_prefix"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.output_color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui_retained_prefix_paint"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear_color[0] as f64,
+                            g: clear_color[1] as f64,
+                            b: clear_color[2] as f64,
+                            a: clear_color[3] as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.render(
+                &mut render_pass.forget_lifetime(),
+                &paint_jobs[..primitive_count],
+                screen_descriptor,
+            );
+        }
+
+        let blit = self
+            .cached_prefix_pipeline
+            .as_ref()
+            .expect("created before the prefix pass");
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("egui_retained_prefix_bind_group"),
+            layout: &blit.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        self.cached_prefix = Some(CachedPrefix {
+            _texture: texture,
+            bind_group,
+            primitive_count,
+            mesh_count: primitive_count,
+            size_in_pixels: screen_descriptor.size_in_pixels,
+            pixels_per_point: screen_descriptor.pixels_per_point,
+            clear_color,
+        });
+    }
+
+    fn create_cached_prefix_pipeline(&self, device: &wgpu::Device) -> CachedPrefixPipeline {
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("egui_retained_prefix_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("egui_retained_prefix_pipeline_layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("egui_retained_prefix_shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("cached_prefix.wgsl"))),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("egui_retained_prefix_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.output_color_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        CachedPrefixPipeline {
+            bind_group_layout,
+            pipeline,
+        }
+    }
+
     /// Should be called before [`Self::render`].
     pub fn update_texture(
         &mut self,
@@ -615,6 +914,7 @@ impl Renderer {
         image_delta: &epaint::ImageDelta,
     ) {
         profiling::function_scope!();
+        self.cached_prefix = None;
 
         let width = image_delta.image.width() as u32;
         let height = image_delta.image.height() as u32;
@@ -753,9 +1053,17 @@ impl Renderer {
     }
 
     pub fn free_texture(&mut self, id: &epaint::TextureId) {
+        self.cached_prefix = None;
         if let Some(texture) = self.textures.remove(id).and_then(|t| t.texture) {
             texture.destroy();
         }
+    }
+
+    /// The layout of the texture bind groups [`Self::texture`] returns, so a
+    /// paint callback can draw egui meshes with its own pipeline (ueye patch:
+    /// retained motion layers).
+    pub fn texture_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.texture_bind_group_layout
     }
 
     /// Get the WGPU texture and bind group associated to a texture that has been allocated by egui.
@@ -876,6 +1184,7 @@ impl Renderer {
         id: epaint::TextureId,
     ) {
         profiling::function_scope!();
+        self.cached_prefix = None;
 
         let Texture {
             bind_group: user_texture_binding,
@@ -921,6 +1230,7 @@ impl Renderer {
         screen_descriptor: &ScreenDescriptor,
     ) -> Vec<wgpu::CommandBuffer> {
         profiling::function_scope!();
+        self.cached_prefix = None;
 
         let screen_size_in_points = screen_descriptor.screen_size_in_points();
 
@@ -939,8 +1249,7 @@ impl Renderer {
             self.previous_uniform_buffer_content = uniform_buffer_content;
         }
 
-        // Determine how many vertices & indices need to be rendered, and gather prepare callbacks
-        let mut callbacks = Vec::new();
+        // Determine how many vertices & indices need to be rendered.
         let (vertex_count, index_count) = {
             profiling::scope!("count_vertices_indices");
             paint_jobs.iter().fold((0, 0), |acc, clipped_primitive| {
@@ -948,14 +1257,7 @@ impl Renderer {
                     Primitive::Mesh(mesh) => {
                         (acc.0 + mesh.vertices.len(), acc.1 + mesh.indices.len())
                     }
-                    Primitive::Callback(callback) => {
-                        if let Some(c) = callback.callback.downcast_ref::<Callback>() {
-                            callbacks.push(c.0.as_ref());
-                        } else {
-                            log::warn!("Unknown paint callback: expected `egui_wgpu::Callback`");
-                        }
-                        acc
-                    }
+                    Primitive::Callback(_) => acc,
                 }
             })
         };
@@ -1051,28 +1353,81 @@ impl Renderer {
             }
         }
 
+        self.prepare_callbacks(device, queue, encoder, paint_jobs, screen_descriptor, false)
+    }
+
+    /// Prepare paint callbacks while retaining the mesh buffers from the previous paint.
+    ///
+    /// A host may use this only when it replays the exact same paint jobs and
+    /// screen descriptor as the last `update_buffers` call. Input, resized
+    /// surfaces, texture changes, or another viewport's mesh update require a
+    /// normal update first.
+    pub fn update_callbacks_only(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+    ) -> Vec<wgpu::CommandBuffer> {
+        self.prepare_callbacks(device, queue, encoder, paint_jobs, screen_descriptor, true)
+    }
+
+    fn prepare_callbacks(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+        retained: bool,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let mut callbacks = Vec::new();
+        for clipped_primitive in paint_jobs {
+            if let Primitive::Callback(callback) = &clipped_primitive.primitive {
+                if let Some(callback) = callback.callback.downcast_ref::<Callback>() {
+                    callbacks.push(callback.0.as_ref());
+                } else {
+                    log::warn!("Unknown paint callback: expected `egui_wgpu::Callback`");
+                }
+            }
+        }
         let mut user_cmd_bufs = Vec::new();
         {
             profiling::scope!("prepare callbacks");
             for callback in &callbacks {
-                user_cmd_bufs.extend(callback.prepare(
-                    device,
-                    queue,
-                    screen_descriptor,
-                    encoder,
-                    &mut self.callback_resources,
-                ));
+                user_cmd_bufs.extend(if retained {
+                    callback.prepare_retained(
+                        device,
+                        queue,
+                        screen_descriptor,
+                        encoder,
+                        &mut self.callback_resources,
+                    )
+                } else {
+                    callback.prepare(
+                        device,
+                        queue,
+                        screen_descriptor,
+                        encoder,
+                        &mut self.callback_resources,
+                    )
+                });
             }
         }
         {
             profiling::scope!("finish prepare callbacks");
             for callback in &callbacks {
-                user_cmd_bufs.extend(callback.finish_prepare(
-                    device,
-                    queue,
-                    encoder,
-                    &mut self.callback_resources,
-                ));
+                user_cmd_bufs.extend(if retained {
+                    callback.finish_prepare_retained(
+                        device,
+                        queue,
+                        encoder,
+                        &mut self.callback_resources,
+                    )
+                } else {
+                    callback.finish_prepare(device, queue, encoder, &mut self.callback_resources)
+                });
             }
         }
 
@@ -1175,4 +1530,264 @@ impl ScissorRect {
 fn renderer_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod retained_prefix_tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    const SIZE: [u32; 2] = [64, 64];
+
+    struct ColorCallback {
+        pipeline: wgpu::RenderPipeline,
+    }
+
+    impl CallbackTrait for ColorCallback {
+        fn paint(
+            &self,
+            _info: PaintCallbackInfo,
+            pass: &mut wgpu::RenderPass<'static>,
+            _resources: &CallbackResources,
+        ) {
+            pass.set_pipeline(&self.pipeline);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    fn color_callback(device: &wgpu::Device) -> epaint::PaintCallback {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("prefix test callback"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
+                r#"
+@vertex fn vs_main(@builtin(vertex_index) id: u32) -> @builtin(position) vec4<f32> {
+    let corners = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+    return vec4<f32>(corners[id], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.12, 0.32, 0.04, 0.55);
+}
+"#,
+            )),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("prefix test callback pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        Callback::new_paint_callback(
+            epaint::emath::Rect::from_min_max(
+                epaint::emath::pos2(15.0, 9.0),
+                epaint::emath::pos2(52.0, 48.0),
+            ),
+            ColorCallback { pipeline },
+        )
+    }
+
+    fn mesh_job(
+        rect: epaint::emath::Rect,
+        clip: epaint::emath::Rect,
+        color: epaint::Color32,
+    ) -> epaint::ClippedPrimitive {
+        let mut mesh = epaint::Mesh::default();
+        mesh.add_colored_rect(rect, color);
+        epaint::ClippedPrimitive {
+            clip_rect: clip,
+            primitive: Primitive::Mesh(mesh),
+        }
+    }
+
+    fn read_frame(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &Renderer,
+        jobs: &[epaint::ClippedPrimitive],
+        screen: &ScreenDescriptor,
+        cached: bool,
+        mut encoder: wgpu::CommandEncoder,
+    ) -> Vec<u8> {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prefix comparison target"),
+            size: wgpu::Extent3d {
+                width: SIZE[0],
+                height: SIZE[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        {
+            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("prefix comparison pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                ..Default::default()
+            });
+            let mut pass = pass.forget_lifetime();
+            if cached {
+                renderer.render_with_cached_prefix(&mut pass, jobs, screen);
+            } else {
+                renderer.render(&mut pass, jobs, screen);
+            }
+        }
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prefix comparison readback"),
+            size: u64::from(SIZE[0] * SIZE[1] * 4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(SIZE[0] * 4),
+                    rows_per_image: Some(SIZE[1]),
+                },
+            },
+            target.size(),
+        );
+        queue.submit([encoder.finish()]);
+        let (send, receive) = mpsc::channel();
+        output
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                send.send(result).expect("receiver is alive");
+            });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(30)),
+            })
+            .expect("GPU completes");
+        receive.recv().unwrap().expect("map readback");
+        let pixels = output.slice(..).get_mapped_range().unwrap().to_vec();
+        output.unmap();
+        pixels
+    }
+
+    #[test]
+    fn retained_prefix_matches_full_paint_with_clips_alpha_and_callback() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = match pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) {
+            Ok(adapter) => adapter,
+            Err(_) => {
+                eprintln!("skipped retained prefix GPU readback: no adapter");
+                return;
+            }
+        };
+        eprintln!(
+            "retained prefix GPU readback: {:?}",
+            adapter.get_info().backend
+        );
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let mut renderer = Renderer::new(
+            &device,
+            wgpu::TextureFormat::Rgba8Unorm,
+            RendererOptions {
+                dithering: false,
+                ..Default::default()
+            },
+        );
+        renderer.update_texture(
+            &device,
+            &queue,
+            epaint::TextureId::Managed(0),
+            &epaint::ImageDelta::full(
+                epaint::ColorImage::filled([1, 1], epaint::Color32::WHITE),
+                epaint::textures::TextureOptions::NEAREST,
+            ),
+        );
+        let full = epaint::emath::Rect::from_min_max(
+            epaint::emath::pos2(0.0, 0.0),
+            epaint::emath::pos2(64.0, 64.0),
+        );
+        let mut jobs = Vec::new();
+        for i in 0..14 {
+            let inset = i as f32;
+            jobs.push(mesh_job(
+                epaint::emath::Rect::from_min_max(
+                    epaint::emath::pos2(inset, inset * 0.5),
+                    epaint::emath::pos2(64.0 - inset, 64.0 - inset * 0.5),
+                ),
+                epaint::emath::Rect::from_min_max(
+                    epaint::emath::pos2(inset + 2.0, 4.0),
+                    epaint::emath::pos2(60.0, 58.0 - inset),
+                ),
+                epaint::Color32::from_rgba_unmultiplied(20 + i * 8, 120, 220, 100),
+            ));
+        }
+        jobs.push(epaint::ClippedPrimitive {
+            clip_rect: full,
+            primitive: Primitive::Callback(color_callback(&device)),
+        });
+        jobs.push(mesh_job(
+            full,
+            epaint::emath::Rect::from_min_max(
+                epaint::emath::pos2(8.0, 20.0),
+                epaint::emath::pos2(56.0, 52.0),
+            ),
+            epaint::Color32::from_rgba_unmultiplied(230, 45, 20, 90),
+        ));
+        let screen = ScreenDescriptor {
+            size_in_pixels: SIZE,
+            pixels_per_point: 1.0,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        renderer.update_buffers(&device, &queue, &mut encoder, &jobs, &screen);
+        let full_pixels = read_frame(&device, &queue, &renderer, &jobs, &screen, false, encoder);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        renderer.prepare_cached_prefix(&device, &mut encoder, &jobs, &screen, [0.0; 4]);
+        assert_eq!(renderer.cached_prefix.as_ref().unwrap().mesh_count, 14);
+        let cached_pixels = read_frame(&device, &queue, &renderer, &jobs, &screen, true, encoder);
+        assert_eq!(cached_pixels, full_pixels);
+    }
 }
